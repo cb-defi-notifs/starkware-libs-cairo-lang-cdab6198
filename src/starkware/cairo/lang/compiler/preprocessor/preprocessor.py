@@ -51,6 +51,7 @@ from starkware.cairo.lang.compiler.ast.code_elements import (
     LangDirective,
 )
 from starkware.cairo.lang.compiler.ast.expr import (
+    ArgList,
     ExprAssignment,
     ExprCast,
     ExprConst,
@@ -81,6 +82,7 @@ from starkware.cairo.lang.compiler.ast.instructions import (
     RetInstruction,
 )
 from starkware.cairo.lang.compiler.ast.module import CairoModule
+from starkware.cairo.lang.compiler.ast.notes import Notes
 from starkware.cairo.lang.compiler.ast.rvalue import RvalueCallInst, RvalueFuncCall
 from starkware.cairo.lang.compiler.ast.types import TypedIdentifier
 from starkware.cairo.lang.compiler.constants import SIZE_CONSTANT
@@ -1158,7 +1160,7 @@ Expected 'elm.element_type' to be a 'namespace'. Found: '{elm.element_type}'."""
             if isinstance(elm.expr, ExprHint):
                 if not isinstance(dest_type, (TypeFelt, TypePointer)):
                     raise PreprocessorError(
-                        "Hint tempvars must be of type felt or a pointer.",
+                        "Only a felt or a pointer can be initialized using nondet.",
                         location=elm.expr.location,
                     )
                 self.visit(
@@ -1866,10 +1868,12 @@ Consider separating the function call and the return statement.""",
         # Visit call_elm to advance pc.
         self.visit(call_elm)
 
+        cairo_type = self.resolve_type(expr_type)
+
         if self.auxiliary_info is not None:
             self.auxiliary_info.add_func_ret_vars([elm.typed_identifier.name])
+            self.auxiliary_info.add_func_ret_types([cairo_type])
 
-        cairo_type = self.resolve_type(expr_type)
         struct_size = self.get_size(cairo_type)
         self.add_simple_reference(
             name=self.current_scope + elm.typed_identifier.identifier.name,
@@ -1973,6 +1977,9 @@ Expected {expected_len} unpacking identifier{suffix}, found {len(unpacking_ident
                 cairo_type = self.resolve_type(typed_identifier.get_type())
             else:
                 cairo_type = member.typ
+
+            if self.auxiliary_info is not None:
+                self.auxiliary_info.add_func_ret_types([cairo_type])
 
             if not check_cast(
                 src_type=member.typ,
@@ -2087,13 +2094,19 @@ Expected expression of type '{member.typ.format()}', got '{cairo_type.format()}'
         for label, change in flows.jumps.items():
             self.flow_tracking.add_flow_to_label(label, change + added_ap)
 
+        if self.auxiliary_info is not None:
+            self.auxiliary_info.set_flow_tracking_after_instr()
+
         # Add flow to next instruction if needed.
         if flows.next_inst is not None:
             # There is a flow to the next instruction. Add ap change.
             self.flow_tracking.add_ap(flows.next_inst + added_ap)
+            if self.auxiliary_info is not None:
+                self.auxiliary_info.set_flow_tracking_after_instr()
         else:
             # There is no flow to the next instruction. Revoke.
             self.flow_tracking.revoke()
+
         return res
 
     def visit_AssertEqInstruction(self, instruction: AssertEqInstruction):
@@ -2125,9 +2138,6 @@ Expected expression of type '{member.typ.format()}', got '{cairo_type.format()}'
         res_instruction: InstructionBody
         if label_pc is None:
             condition = instruction.condition
-            if condition is not None:
-                condition = self.simplify_expr_as_felt(condition)
-            res_instruction = dataclasses.replace(instruction, condition=condition)
             if self.auxiliary_info is not None:
                 self.auxiliary_info.record_jump_to_labeled_instruction(
                     label_name=label_full_name,
@@ -2135,6 +2145,9 @@ Expected expression of type '{member.typ.format()}', got '{cairo_type.format()}'
                     current_pc=self.current_pc,
                     pc_dest=None,
                 )
+            if condition is not None:
+                condition = self.simplify_expr_as_felt(condition)
+            res_instruction = dataclasses.replace(instruction, condition=condition)
         else:
             jump_offset = ExprConst(
                 val=label_pc - self.current_pc, location=instruction.label.location
@@ -2154,9 +2167,7 @@ Expected expression of type '{member.typ.format()}', got '{cairo_type.format()}'
             if self.auxiliary_info is not None:
                 self.auxiliary_info.record_jump_to_labeled_instruction(
                     label_name=label_full_name,
-                    condition=self.simplify_expr_as_felt(instruction.condition)
-                    if instruction.condition is not None
-                    else None,
+                    condition=instruction.condition,
                     current_pc=self.current_pc,
                     pc_dest=label_pc,
                 )
@@ -2318,6 +2329,30 @@ Expected expression of type '{expected_type.format()}', got '{expr_type.format()
         Takes a simplified expression and its type and splits it into a list of typeless expressions
         that can be passed to process_compound_expressions.
         """
+
+        if isinstance(expr, ExprNewOperator) and isinstance(expr_type, TypePointer):
+            # If this is the first time we visit this expression (expr_type is a pointer rather than
+            # a felt), split the typed inner expression into a tuple of typeless expressions.
+
+            inner_exprs = self.simplified_expr_to_felt_expr_list(
+                expr=expr.expr, expr_type=expr_type.pointee
+            )
+            inner_location = expr.expr.location
+            tuple_expr = ExprTuple(
+                members=ArgList(
+                    args=[
+                        ExprAssignment(
+                            identifier=None, expr=inner_expr, location=inner_expr.location
+                        )
+                        for inner_expr in inner_exprs
+                    ],
+                    notes=[Notes() for _ in range(len(inner_exprs) + 1)],
+                    has_trailing_comma=True,
+                    location=inner_location,
+                ),
+                location=inner_location,
+            )
+            return [ExprNewOperator(expr=tuple_expr, is_typed=False, location=expr.location)]
 
         if isinstance(expr_type, (TypeFelt, TypePointer, TypeCodeoffset)):
             return [expr]

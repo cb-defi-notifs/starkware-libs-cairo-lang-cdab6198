@@ -12,7 +12,9 @@ py_library(
     deps = [
         "//src/starkware/crypto:starkware_crypto_lib",
         "//src/starkware/eth:web3_wrapper_lib",
+        "//src/starkware/python:starkware_python_utils_lib",
         "//src/starkware/starkware_utils:starkware_dataclasses_field_utils_lib",
+        "//src/starkware/starkware_utils:starkware_dataclasses_utils_lib",
         "//src/starkware/starkware_utils:starkware_error_handling_lib",
         requirement("marshmallow"),
         requirement("web3"),
@@ -26,7 +28,7 @@ py_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "//src/starkware/starkware_utils:starkware_config_utils_lib",
+        "//src/services/config:base_general_config_lib",
         requirement("marshmallow_dataclass"),
     ],
 )

@@ -9,8 +9,10 @@ import subprocess
 from time import sleep
 from typing import Dict
 
+import eth_account
 from eth_account.signers.base import BaseAccount
 from web3 import HTTPProvider, Web3, eth
+from web3.types import Wei
 
 from demo.amm_demo.prove_batch import Account, Balance, BatchProver, SwapTransaction
 from starkware.cairo.bootloaders.hash_program import compute_program_hash_chain
@@ -63,7 +65,7 @@ def deploy_contract(batch_prover: BatchProver, w3: Web3, operator: BaseAccount) 
     account_tree_root = get_merkle_root(batch_prover.accounts)
     amount_token_a = batch_prover.balance.a
     amount_token_b = batch_prover.balance.b
-    program_hash = compute_program_hash_chain(batch_prover.program)
+    program_hash = compute_program_hash_chain(program=batch_prover.program, use_pedersen=False)
     cairo_verifier = batch_prover.sharp_client.contract_client.contract.address
 
     # Compile the smart contract.
@@ -127,7 +129,7 @@ def main():
 
     # Initialize Ethereum account for on-chain transaction sending.
     operator_private_key_str = input(
-        "Please enter an operator private key, " "or press Enter to generate a new private key: "
+        "Please enter an operator private key, or press Enter to generate a new private key: "
     )
     try:
         operator_private_key = int(operator_private_key_str, 16)
@@ -135,15 +137,15 @@ def main():
         print("Generating a random key...")
         operator_private_key = random.randint(0, 2**256)
     operator_private_key = "0x{:064x}".format(operator_private_key)
-    operator = eth.Account.from_key(operator_private_key)
+    operator = Account.from_key(operator_private_key)
 
     # Ask for funds to be transferred to the operator account id its balance is too low.
-    if w3.eth.getBalance(operator.address) < MIN_OPERATOR_BALANCE:
+    if w3.eth.get_balance(operator.address) < MIN_OPERATOR_BALANCE:
         input(
             f"Please send funds (at least {MIN_OPERATOR_BALANCE * 10**-18} Goerli ETH) "
             f"to {operator.address} and press enter."
         )
-        while w3.eth.getBalance(operator.address) < MIN_OPERATOR_BALANCE:
+        while w3.eth.get_balance(operator.address) < MIN_OPERATOR_BALANCE:
             print("Funds not received yet...")
             sleep(15)
 
@@ -182,18 +184,18 @@ def main():
     print("AMM Demo finished successfully :)")
 
 
-def tx_kwargs(w3: Web3, sender_account: eth.Account):
+def tx_kwargs(w3: Web3, sender_account: eth_account.Account):
     """
     Helper function used to send Ethereum transactions.
 
     w3: a web3 Ethereum client.
     sender_account: the account sending the transaction.
     """
-    nonce = w3.eth.getTransactionCount(sender_account)
-    return {"from": sender_account, "gas": 10**6, "gasPrice": GAS_PRICE, "nonce": nonce}
+    nonce = w3.eth.get_transaction_count(sender_account)
+    return {"from": sender_account, "gas": 10**6, "gasPrice": Wei(GAS_PRICE), "nonce": nonce}
 
 
-def send_transaction(w3, transaction, sender_account: BaseAccount):
+def send_transaction(w3: Web3, transaction, sender_account: BaseAccount):
     """
     Sends an Ethereum transaction and waits for it to be mined.
 
@@ -204,9 +206,9 @@ def send_transaction(w3, transaction, sender_account: BaseAccount):
     transaction_dict = transaction.buildTransaction(tx_kwargs(w3, sender_account.address))
     signed_transaction = sender_account.signTransaction(transaction_dict)
     print("Transaction built and signed.")
-    tx_hash = w3.eth.sendRawTransaction(signed_transaction.rawTransaction).hex()
+    tx_hash = w3.eth.send_raw_transaction(signed_transaction.rawTransaction).hex()
     print(f"Transaction sent. tx_hash={tx_hash} .")
-    receipt = w3.eth.waitForTransactionReceipt(tx_hash)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
     print("Transaction successfully mined.")
     return receipt
 

@@ -1,4 +1,5 @@
 from starkware.cairo.common.cairo_secp.ec import EcPoint
+from starkware.cairo.common.sha256_state import Sha256Input, Sha256State
 from starkware.cairo.common.uint256 import Uint256
 
 // Syscall selectors.
@@ -8,7 +9,18 @@ const DEPLOY_SELECTOR = 'Deploy';
 const EMIT_EVENT_SELECTOR = 'EmitEvent';
 const GET_BLOCK_HASH_SELECTOR = 'GetBlockHash';
 const GET_EXECUTION_INFO_SELECTOR = 'GetExecutionInfo';
+const SECP256K1_ADD_SELECTOR = 'Secp256k1Add';
+const SECP256K1_GET_POINT_FROM_X_SELECTOR = 'Secp256k1GetPointFromX';
+const SECP256K1_GET_XY_SELECTOR = 'Secp256k1GetXy';
+const SECP256K1_MUL_SELECTOR = 'Secp256k1Mul';
+const SECP256K1_NEW_SELECTOR = 'Secp256k1New';
+const SECP256R1_ADD_SELECTOR = 'Secp256r1Add';
+const SECP256R1_GET_POINT_FROM_X_SELECTOR = 'Secp256r1GetPointFromX';
+const SECP256R1_GET_XY_SELECTOR = 'Secp256r1GetXy';
+const SECP256R1_MUL_SELECTOR = 'Secp256r1Mul';
+const SECP256R1_NEW_SELECTOR = 'Secp256r1New';
 const KECCAK_SELECTOR = 'Keccak';
+const SHA256_PROCESS_BLOCK_SELECTOR = 'Sha256ProcessBlock';
 const LIBRARY_CALL_SELECTOR = 'LibraryCall';
 const REPLACE_CLASS_SELECTOR = 'ReplaceClass';
 const SEND_MESSAGE_TO_L1_SELECTOR = 'SendMessageToL1';
@@ -38,6 +50,15 @@ struct BlockInfo {
     sequencer_address: felt,
 }
 
+struct ResourceBounds {
+    // The name of the resource (e.g., 'L1_GAS').
+    resource: felt,
+    // The maximum amount of the resource allowed for usage during the execution.
+    max_amount: felt,
+    // The maximum price the user is willing to pay for the resource unit.
+    max_price_per_unit: felt,
+}
+
 struct TxInfo {
     // The version of the transaction. It is fixed in the OS, and should be signed by the account
     // contract.
@@ -58,6 +79,24 @@ struct TxInfo {
     chain_id: felt,
     // The transaction's nonce.
     nonce: felt,
+    // An array of ResourceBounds structs.
+    resource_bounds_start: ResourceBounds*,
+    resource_bounds_end: ResourceBounds*,
+    // The tip.
+    tip: felt,
+    // If specified, the paymaster should pay for the execution of the tx.
+    // The data includes the address of the paymaster sponsoring the transaction, followed by extra
+    // data to send to the paymaster.
+    paymaster_data_start: felt*,
+    paymaster_data_end: felt*,
+    // The data availability mode for the nonce.
+    nonce_data_availability_mode: felt,
+    // The data availability mode for the account balance from which fee will be taken.
+    fee_data_availability_mode: felt,
+    // If nonempty, will contain the required data for deploying and initializing an account
+    // contract: its class hash, address salt and constructor calldata.
+    account_deployment_data_start: felt*,
+    account_deployment_data_end: felt*,
 }
 
 // Shared attributes.
@@ -130,6 +169,53 @@ struct KeccakRequest {
     input_end: felt*,
 }
 
+struct Sha256ProcessBlockRequest {
+    state_ptr: Sha256State*,
+    input_start: Sha256Input*,
+}
+
+struct SecpAddRequest {
+    p0: EcPoint*,
+    p1: EcPoint*,
+}
+
+using Secp256k1AddRequest = SecpAddRequest;
+using Secp256r1AddRequest = SecpAddRequest;
+
+struct SecpMulRequest {
+    p: EcPoint*,
+    scalar: Uint256,
+}
+
+using Secp256k1MulRequest = SecpMulRequest;
+using Secp256r1MulRequest = SecpMulRequest;
+
+struct SecpNewRequest {
+    // The x and y coordinates of the requested point on the Secp curve.
+    // The point at infinity, can be created by passing (0, 0).
+    x: Uint256,
+    y: Uint256,
+}
+
+using Secp256k1NewRequest = SecpNewRequest;
+using Secp256r1NewRequest = SecpNewRequest;
+
+struct SecpGetPointFromXRequest {
+    x: Uint256,
+    y_parity: felt,
+}
+
+using Secp256k1GetPointFromXRequest = SecpGetPointFromXRequest;
+using Secp256r1GetPointFromXRequest = SecpGetPointFromXRequest;
+
+struct SecpGetXyRequest {
+    // A pointer to the point.
+    ec_point: EcPoint*,
+}
+
+using Secp256k1GetXyRequest = SecpGetXyRequest;
+using Secp256r1GetXyRequest = SecpGetXyRequest;
+
 struct StorageReadRequest {
     reserved: felt,
     key: felt,
@@ -175,6 +261,41 @@ struct KeccakResponse {
     result_low: felt,
     result_high: felt,
 }
+
+struct Sha256ProcessBlockResponse {
+    state_ptr: Sha256State*,
+}
+
+struct SecpGetXyResponse {
+    // The x and y coordinates of the given point. Returns (0, 0) for the point at infinity.
+    x: Uint256,
+    y: Uint256,
+}
+
+using Secp256k1GetXyResponse = SecpGetXyResponse;
+using Secp256r1GetXyResponse = SecpGetXyResponse;
+
+struct SecpNewResponse {
+    // The syscall returns `Option<SecpPoint>` which is represented as two felts in memory.
+
+    // 1 if the point is not on the curve, 0 otherwise.
+    not_on_curve: felt,
+    // A pointer to the point in the case not_on_curve == 0, otherwise 0.
+    ec_point: EcPoint*,
+}
+
+using Secp256k1NewResponse = SecpNewResponse;
+using Secp256r1NewResponse = SecpNewResponse;
+
+struct SecpOpResponse {
+    // The result of Secp256k1 or Secp256r1 add or mul operations.
+    ec_point: EcPoint*,
+}
+
+using Secp256k1AddResponse = SecpOpResponse;
+using Secp256k1MulResponse = SecpOpResponse;
+using Secp256r1AddResponse = SecpOpResponse;
+using Secp256r1MulResponse = SecpOpResponse;
 
 struct StorageReadResponse {
     value: felt,

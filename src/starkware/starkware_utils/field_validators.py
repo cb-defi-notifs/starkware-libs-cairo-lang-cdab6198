@@ -60,7 +60,7 @@ def validate_url(
     allow_none: bool = False,
 ) -> ValidatorType:
     error_message = (
-        "Invalid {url_name} URL: {{input}}; " "must be a legal URL starting with {schemes}"
+        "Invalid {url_name} URL: {{input}}; must be a legal URL starting with {schemes}"
     ).format(url_name=url_name, schemes=",".join(schemes))
     url_validator = marshmallow.validate.URL(
         schemes=schemes, require_tld=require_full_url, error=error_message
@@ -73,6 +73,13 @@ def validate_url(
         return url_validator(value)
 
     return validator
+
+
+validate_strk_price_oracle_url = validate_url(
+    url_name="STRK price oracle endpoint",
+    schemes={"http", "https"},
+    require_full_url=False,
+)
 
 
 validate_feeder_gateway_url = validate_url(
@@ -191,10 +198,39 @@ def validate_positive(field_name: str, *, allow_none: bool = False) -> Validator
     )
 
 
-def validate_non_negative(field_name, *, allow_none=False):
-    error_message = "Invalid {field_name}: {{input}}; must be a non-negative value".format(
-        field_name=field_name
-    )
+def validate_non_negative_or_negative_default(
+    field_name: str, *, default_value: int, allow_none: bool = False
+) -> ValidatorType:
+    """
+    Validates that the input is non-negative, or equal to the default value. Also, the default value
+    must be negative.
+    """
+    error_message = f"Invalid {field_name}: {{input}}; must be non-negative or {default_value}."
+
+    def validator(value):
+        if default_value >= 0:
+            raise ValueError(
+                f"Invalid default value: {default_value}. The default value must be negative."
+            )
+        if value == default_value:
+            return True
+        return validate_non_negative(
+            field_name=field_name, allow_none=allow_none, error_message=error_message
+        )(value)
+
+    return validator
+
+
+def validate_non_negative(
+    field_name,
+    *,
+    allow_none=False,
+    error_message: Optional[str] = None,
+):
+    if error_message is None:
+        error_message = "Invalid {field_name}: {{input}}; must be a non-negative value".format(
+            field_name=field_name
+        )
     return validate_in_range(
         field_name=field_name,
         min_value=0,
@@ -393,3 +429,8 @@ def validate_power_of_two(field_name: str) -> ValidatorType:
         return True
 
     return validator
+
+
+def validate_probabilities_sum(*probabilities: float):
+    if sum(probabilities) > 1:
+        raise ValueError("The sum of the probabilities must be at most 1.")

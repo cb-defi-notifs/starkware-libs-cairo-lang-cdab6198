@@ -1,4 +1,4 @@
-%builtins output pedersen range_check ecdsa bitwise ec_op keccak poseidon
+%builtins output pedersen range_check ecdsa bitwise ec_op keccak poseidon range_check96 add_mod mul_mod
 
 from starkware.cairo.common.alloc import alloc
 from starkware.cairo.common.bool import FALSE
@@ -6,6 +6,7 @@ from starkware.cairo.common.cairo_builtins import (
     BitwiseBuiltin,
     HashBuiltin,
     KeccakBuiltin,
+    ModBuiltin,
     PoseidonBuiltin,
 )
 from starkware.cairo.common.dict import dict_new, dict_update
@@ -24,10 +25,16 @@ from starkware.starknet.core.os.execution.deprecated_execute_syscalls import (
 from starkware.starknet.core.os.execution.execute_syscalls import execute_syscalls
 from starkware.starknet.core.os.execution.execute_transactions import execute_transactions
 from starkware.starknet.core.os.os_config.os_config import get_starknet_os_config_hash
-from starkware.starknet.core.os.output import OsCarriedOutputs, os_output_serialize
-from starkware.starknet.core.os.state import StateEntry, state_update
+from starkware.starknet.core.os.output import (
+    OsCarriedOutputs,
+    OsOutput,
+    OsOutputHeader,
+    serialize_os_output,
+)
+from starkware.starknet.core.os.state.commitment import StateEntry
+from starkware.starknet.core.os.state.state import OsStateUpdate, state_update
 
-// Executes transactions on StarkNet.
+// Executes transactions on Starknet.
 func main{
     output_ptr: felt*,
     pedersen_ptr: HashBuiltin*,
@@ -37,6 +44,9 @@ func main{
     ec_op_ptr,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
 }() {
     alloc_locals;
 
@@ -85,30 +95,27 @@ func main{
     }
     let final_carried_outputs = outputs;
 
-    local initial_state_updates_ptr: felt*;
     %{
         # This hint shouldn't be whitelisted.
         vm_enter_scope(dict(
             commitment_info_by_address=execution_helper.compute_storage_commitments(),
             os_input=os_input,
         ))
-        ids.initial_state_updates_ptr = segments.add_temp_segment()
     %}
-    let state_updates_ptr = initial_state_updates_ptr;
 
-    with state_updates_ptr {
-        let (state_update_output) = state_update{hash_ptr=pedersen_ptr}(
+    let (squashed_os_state_update, state_update_output) = state_update{hash_ptr=pedersen_ptr}(
+        os_state_update=OsStateUpdate(
             contract_state_changes_start=contract_state_changes_start,
             contract_state_changes_end=contract_state_changes,
             contract_class_changes_start=contract_class_changes_start,
             contract_class_changes_end=contract_class_changes,
-        );
-    }
+        ),
+    );
 
     %{ vm_exit_scope() %}
 
     // Compute the general config hash.
-    // This is done here to avoid passing pedersen_ptr to os_output_serialize.
+    // This is done here to avoid passing pedersen_ptr to serialize_output_header.
     let hash_ptr = pedersen_ptr;
     with hash_ptr {
         let (starknet_os_config_hash) = get_starknet_os_config_hash(
@@ -117,14 +124,43 @@ func main{
     }
     let pedersen_ptr = hash_ptr;
 
-    os_output_serialize(
-        block_context=block_context,
-        state_update_output=state_update_output,
-        initial_carried_outputs=initial_carried_outputs,
-        final_carried_outputs=final_carried_outputs,
-        state_updates_ptr_start=initial_state_updates_ptr,
-        state_updates_ptr_end=state_updates_ptr,
-        starknet_os_config_hash=starknet_os_config_hash,
+    // Guess whether to use KZG commitment scheme and whether to output the full state.
+    local use_kzg_da = nondet %{
+        syscall_handler.block_info.use_kzg_da and (
+            not os_input.full_output
+        )
+    %};
+    local full_output = nondet %{ os_input.full_output %};
+
+    // Verify that the guessed values are 0 or 1.
+    assert use_kzg_da * use_kzg_da = use_kzg_da;
+    assert full_output * full_output = full_output;
+
+    // Serialize OS output.
+
+    %{
+        __serialize_data_availability_create_pages__ = True
+        kzg_manager = execution_helper.kzg_manager
+    %}
+
+    // Currently, the block hash is not enforced by the OS.
+    serialize_os_output(
+        os_output=new OsOutput(
+            header=new OsOutputHeader(
+                state_update_output=state_update_output,
+                prev_block_number=block_context.block_info_for_execute.block_number - 1,
+                new_block_number=block_context.block_info_for_execute.block_number,
+                prev_block_hash=nondet %{ os_input.prev_block_hash %},
+                new_block_hash=nondet %{ os_input.new_block_hash %},
+                os_program_hash=0,
+                starknet_os_config_hash=starknet_os_config_hash,
+                use_kzg_da=use_kzg_da,
+                full_output=full_output,
+            ),
+            squashed_os_state_update=squashed_os_state_update,
+            initial_carried_outputs=initial_carried_outputs,
+            final_carried_outputs=final_carried_outputs,
+        ),
     );
 
     // Make sure that we report using at least 1 range check to guarantee that
@@ -168,7 +204,8 @@ func write_block_number_to_block_hash_mapping{range_check_ptr, contract_state_ch
     block_context: BlockContext*
 ) {
     alloc_locals;
-    tempvar old_block_number = block_context.block_info.block_number - STORED_BLOCK_HASH_BUFFER;
+    tempvar old_block_number = block_context.block_info_for_execute.block_number -
+        STORED_BLOCK_HASH_BUFFER;
     let is_old_block_number_non_negative = is_nn(old_block_number);
     if (is_old_block_number_non_negative == FALSE) {
         // Not enough blocks in the system - nothing to write.

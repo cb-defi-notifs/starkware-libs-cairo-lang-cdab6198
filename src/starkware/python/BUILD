@@ -65,6 +65,7 @@ py_library(
     visibility = ["//visibility:public"],
     deps = [
         requirement("mypy_extensions"),
+        requirement("pytest"),
     ],
 )
 
@@ -78,10 +79,10 @@ pytest_test(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "starkware_expression_string_lib",
-        "starkware_json_rpc_lib",
-        "starkware_python_test_utils_lib",
-        "starkware_python_utils_lib",
+        ":starkware_expression_string_lib",
+        ":starkware_python_test_utils_lib",
+        ":starkware_python_utils_lib",
+        requirement("numpy"),
         requirement("pytest_asyncio"),
     ],
 )

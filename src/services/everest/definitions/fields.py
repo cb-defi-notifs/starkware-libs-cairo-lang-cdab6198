@@ -1,11 +1,10 @@
 import dataclasses
 import random
 import string
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Type
 
 import marshmallow.fields as mfields
-import marshmallow.utils
-from eth_typing import ChecksumAddress
+from web3.types import ChecksumAddress
 
 from services.everest.definitions import constants
 from starkware.crypto.signature.signature import FIELD_PRIME
@@ -14,7 +13,11 @@ from starkware.python.utils import initialize_random
 from starkware.starkware_utils.error_handling import StarkErrorCode
 from starkware.starkware_utils.field_validators import validate_non_negative
 from starkware.starkware_utils.marshmallow_dataclass_fields import StrictRequiredInteger
-from starkware.starkware_utils.validated_fields import RangeValidatedField, ValidatedField
+from starkware.starkware_utils.validated_fields import (
+    OptionalField,
+    RangeValidatedField,
+    ValidatedField,
+)
 
 # Fields data: validation data, dataclass metadata.
 tx_id_marshmallow_field = StrictRequiredInteger(validate=validate_non_negative("tx_id"))
@@ -27,10 +30,8 @@ class EthAddressTypeField(ValidatedField[str]):
     A field representation of an Ethereum address.
     """
 
-    error_message: ClassVar[str] = "{name} {value} is out of range / not checksummed."
-
-    def __init__(self, name, error_code):
-        super().__init__(name, error_code)
+    def error_message(self, value: str) -> str:
+        return f"{self.name} {value} is out of range / not checksummed."
 
     # Randomization.
     def get_random_value(self, random_object: Optional[random.Random] = None) -> str:
@@ -50,26 +51,15 @@ class EthAddressTypeField(ValidatedField[str]):
             self.get_random_value() + "0",  # type: ignore # Too long address.
         ]
 
-    def format_invalid_value_error_message(self, value: str, name: Optional[str] = None) -> str:
-        return self.error_message.format(
-            name=self.name if name is None else name,
-            value=value,
-        )
-
     # Serialization.
-    def get_marshmallow_field(
-        self, required: bool = True, load_default: Any = marshmallow.utils.missing
-    ) -> mfields.Field:
-        return mfields.String(required=required, load_default=load_default)
+    def get_marshmallow_type(self) -> Type[mfields.Field]:
+        return mfields.String
 
     def convert_valid_to_checksum(self, value: str) -> ChecksumAddress:
         self.validate(value=value)
         # This won't change value. It will only allow the function to return value as return
         # ChecksumAddress.
         return Web3.to_checksum_address(value=value)  # type: ignore
-
-    def format(self, value: str) -> str:
-        return value
 
 
 FactRegistryField = EthAddressTypeField(
@@ -88,6 +78,8 @@ EthAddressIntField = RangeValidatedField(
     formatter=None,
 )
 
+EthAddressHexField = dataclasses.replace(EthAddressIntField, formatter=hex)
+
 FeltField = RangeValidatedField(
     lower_bound=0,
     upper_bound=FIELD_PRIME,
@@ -95,6 +87,22 @@ FeltField = RangeValidatedField(
     error_code=StarkErrorCode.OUT_OF_RANGE_FIELD_ELEMENT,
     formatter=hex,
 )
+
+OptionalFeltField = OptionalField(field=FeltField, none_probability=0)
+
+felt_as_hex_list_metadata = dict(marshmallow_field=mfields.List(FeltField.get_marshmallow_field()))
+
+
+def get_bounded_int_range_validator(
+    lower_bound: int = 0, upper_bound: int = FIELD_PRIME
+) -> RangeValidatedField:
+    return RangeValidatedField(
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+        name=f"Integer in range [{lower_bound}, {upper_bound})",
+        error_code=StarkErrorCode.OUT_OF_RANGE_FIELD_ELEMENT,
+        formatter=hex,
+    )
 
 
 def felt(name_in_error_message: str) -> RangeValidatedField:

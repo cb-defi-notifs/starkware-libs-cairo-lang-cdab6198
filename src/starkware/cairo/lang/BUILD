@@ -1,4 +1,5 @@
-load("//src/starkware/cairo:vars.bzl", "CAIRO_COMPILER_ARCHIVE", "CAIRO_INSTANCES_LIB_ADDITIONAL_FILES")
+load("//src/starkware/cairo:vars.bzl", "CAIRO_INSTANCES_LIB_ADDITIONAL_FILES")
+load("//src/starkware/cairo:vars_cairo_compiler.bzl", "CAIRO_COMPILER_ARCHIVE")
 load("//bazel_utils:python.bzl", "py_exe")
 
 # Python library with all the dependencies that should be part of the cairo-lang package.
@@ -37,9 +38,12 @@ py_library(
 # to create the cairo-lang package zip.
 py_exe(
     name = "create_cairo_lang_package_zip",
+    data = [
+        ":VERSION",
+    ],
     module = "starkware.cairo.lang.create_cairo_lang_zip",
     deps = [
-        "cairo_lang_package_lib",
+        ":cairo_lang_package_lib",
         "//src/starkware/python:starkware_python_utils_lib",
     ],
 )
@@ -70,6 +74,8 @@ py_library(
     deps = [
         "//src/starkware/cairo/lang/builtins:cairo_all_builtins_lib",
         "//src/starkware/cairo/lang/builtins:cairo_run_builtins_lib",
+        "//src/starkware/cairo/lang/builtins:instance_def_lib",
+        "//src/starkware/python:starkware_python_utils_lib",
     ],
 )
 
@@ -90,5 +96,9 @@ py_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":cairo_instances_lib",
+        "//src/starkware/cairo/lang/builtins:cairo_all_builtins_lib",
+        "//src/starkware/cairo/lang/builtins:instance_def_lib",
+        "//src/starkware/python:starkware_python_utils_lib",
     ],
 )

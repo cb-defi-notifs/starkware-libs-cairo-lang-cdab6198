@@ -1,6 +1,7 @@
 from starkware.cairo.common.alloc import alloc
-from starkware.cairo.common.cairo_builtins import BitwiseBuiltin, HashBuiltin
-from starkware.cairo.stark_verifier.air.config import TracesConfig, traces_config_validate
+from starkware.cairo.common.cairo_builtins import BitwiseBuiltin, PoseidonBuiltin
+from starkware.cairo.stark_verifier.air.config_instances import TracesConfig
+from starkware.cairo.stark_verifier.air.config_interface import traces_config_validate
 from starkware.cairo.stark_verifier.air.layout import AirWithLayout
 from starkware.cairo.stark_verifier.air.public_input import PublicInput
 from starkware.cairo.stark_verifier.core.channel import (
@@ -66,9 +67,7 @@ struct TracesWitness {
 
 // Reads the traces commitment from the channel.
 // Returns the commitment, along with GlobalValue required to evaluate the constraint polynomial.
-func traces_commit{
-    range_check_ptr, blake2s_ptr: felt*, bitwise_ptr: BitwiseBuiltin*, channel: Channel
-}(
+func traces_commit{range_check_ptr, poseidon_ptr: PoseidonBuiltin*, channel: Channel}(
     air: AirWithLayout*,
     public_input: PublicInput*,
     unsent_commitment: TracesUnsentCommitment*,
@@ -105,7 +104,10 @@ func traces_commit{
 // Verifies a decommitment for the traces at the query indices.
 // decommitment - holds the commited values of the leaves at the query_indices.
 func traces_decommit{
-    range_check_ptr, blake2s_ptr: felt*, pedersen_ptr: HashBuiltin*, bitwise_ptr: BitwiseBuiltin*
+    range_check_ptr,
+    blake2s_ptr: felt*,
+    bitwise_ptr: BitwiseBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
 }(
     air: AirWithLayout*,
     n_queries: felt,

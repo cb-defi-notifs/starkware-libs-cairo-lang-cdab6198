@@ -1,10 +1,34 @@
 import base64
 import gzip
 import json
+from typing import Set
 
 from services.external_api.client import JsonObject
+from starkware.starknet.definitions import constants
 from starkware.starknet.definitions.error_codes import StarknetErrorCode
+from starkware.starknet.definitions.transaction_type import TransactionType
 from starkware.starkware_utils.error_handling import wrap_with_stark_exception
+from starkware.starkware_utils.validated_dataclass import rename_old_field_in_pre_load
+
+# The following transaction types will only be supported from a certain version after regenesis.
+DEPRECATED_TX_TYPES_FOR_SCHEMA: Set[str] = {
+    TransactionType.DECLARE.name,
+    TransactionType.DEPLOY_ACCOUNT.name,
+    TransactionType.INVOKE_FUNCTION.name,
+}
+
+
+def is_deprecated_tx(raw_tx_type: str, version: int) -> bool:
+    """
+    Returns whether the given parameters represent a deprecated transaction.
+    """
+    is_deprecated_external_version = version < 3
+    is_deprecated_simulation_version = (
+        constants.QUERY_VERSION_BASE <= version < constants.QUERY_VERSION_BASE + 3
+    )
+    is_version_deprecated = is_deprecated_external_version or is_deprecated_simulation_version
+
+    return raw_tx_type in DEPRECATED_TX_TYPES_FOR_SCHEMA and is_version_deprecated
 
 
 def compress_program(program_json: JsonObject) -> str:
@@ -51,7 +75,6 @@ def decompress_program_pre_load(data: JsonObject, program_attr_name: str) -> Jso
 
 
 def rename_contract_address_to_sender_address_pre_load(data: JsonObject) -> JsonObject:
-    if "contract_address" in data:
-        assert "sender_address" not in data
-        data["sender_address"] = data.pop("contract_address")
-    return data
+    return rename_old_field_in_pre_load(
+        data=data, old_field_name="contract_address", new_field_name="sender_address"
+    )

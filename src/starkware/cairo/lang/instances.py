@@ -11,12 +11,15 @@ from starkware.cairo.lang.builtins.bitwise.instance_def import BitwiseInstanceDe
 from starkware.cairo.lang.builtins.ec.instance_def import EcOpInstanceDef
 from starkware.cairo.lang.builtins.hash.instance_def import PedersenInstanceDef
 from starkware.cairo.lang.builtins.instance_def import BuiltinInstanceDef
-from starkware.cairo.lang.builtins.keccak.instance_def import KeccakInstanceDef
+from starkware.cairo.lang.builtins.keccak.instance_def import KECCAK_BATCH_SIZE, KeccakInstanceDef
+from starkware.cairo.lang.builtins.modulo.instance_def import AddModInstanceDef, MulModInstanceDef
 from starkware.cairo.lang.builtins.poseidon.instance_def import PoseidonInstanceDef
 from starkware.cairo.lang.builtins.range_check.instance_def import RangeCheckInstanceDef
 from starkware.cairo.lang.builtins.signature.instance_def import EcdsaInstanceDef
+from starkware.python.math_utils import div_ceil, safe_div
 
 PRIME = 2**251 + 17 * 2**192 + 1
+COMPONENT_HEIGHT = 16
 
 DYNAMIC_LAYOUT_NAME = "dynamic"
 
@@ -33,7 +36,7 @@ class DilutedPoolInstanceDef:
     # and the number of cpu steps.
     # The case of log_units_per_step < 0 is possible when there are only few
     # builtins that require diluted units (as bitwise and keccak).
-    log_units_per_step: int
+    log_units_per_step: Optional[int]
 
     # In diluted form the binary sequence **** of length n_bits is represented as 00*00*00*00*,
     # with (spacing - 1) zero bits between consecutive information carying bits.
@@ -64,16 +67,26 @@ class BuiltinsInfo:
 @dataclasses.dataclass
 class CairoLayout:
     layout_name: str = ""
-    cpu_component_step: int = 1
+    cpu_component_step: Optional[int] = 1
     # Range check units.
-    rc_units: int = 16
+    rc_units: Optional[int] = 16
     builtins: Dict[str, Any] = field(default_factory=lambda: {})
     # The ratio between the number of public memory cells and the total number of memory cells.
     public_memory_fraction: int = 4
-    memory_units_per_step: int = 8
+    memory_units_per_step: Optional[int] = 8
     diluted_pool_instance_def: Optional[DilutedPoolInstanceDef] = None
     n_trace_columns: Optional[int] = None
     cpu_instance_def: CpuInstanceDef = field(default=CpuInstanceDef())
+
+    @property
+    def diluted_units_row_ratio(self) -> Optional[int]:
+        assert self.diluted_pool_instance_def is not None
+        log_units_per_step = self.diluted_pool_instance_def.log_units_per_step
+        assert log_units_per_step is not None
+        assert self.cpu_component_step is not None
+        if log_units_per_step >= 0:
+            return safe_div(COMPONENT_HEIGHT * self.cpu_component_step, 2**log_units_per_step)
+        return COMPONENT_HEIGHT * self.cpu_component_step * 2**-log_units_per_step
 
 
 def build_builtins_dict_with_default_params(
@@ -84,63 +97,127 @@ def build_builtins_dict_with_default_params(
     The ratios are allowed to be None - this is used when constructing the AIR before knowing the
     ratios.
     """
-    assert all(builtin in SUPPORTED_DYNAMIC_BUILTINS for builtin in ratios.keys())
-
-    return dict(
-        output=True,
-        pedersen=PedersenInstanceDef(
-            ratio=ratios.get("pedersen"),
-            repetitions=4,
-            element_height=256,
-            element_bits=252,
-            n_inputs=2,
-            hash_limit=PRIME,
-        ),
-        range_check=RangeCheckInstanceDef(
-            ratio=ratios.get("range_check"),
-            n_parts=8,
-        ),
-        ecdsa=EcdsaInstanceDef(
-            ratio=ratios.get("ecdsa"),
-            repetitions=1,
-            height=256,
-            n_hash_bits=251,
-        ),
-        bitwise=BitwiseInstanceDef(
-            ratio=ratios.get("bitwise"),
-            total_n_bits=251,
-        ),
-        ec_op=EcOpInstanceDef(
-            ratio=ratios.get("ec_op"),
-            scalar_height=256,
-            scalar_bits=252,
-            scalar_limit=PRIME,
-        ),
-        poseidon=PoseidonInstanceDef(
-            ratio=ratios.get("poseidon"),
-            partial_rounds_partition=[64, 22],
-        ),
+    assert all(
+        builtin in SUPPORTED_DYNAMIC_BUILTINS
+        for builtin in ratios.keys()
+        if not builtin.endswith("_den")
+    )
+    builtin_dict: Dict[str, Union[BuiltinInstanceDef, bool]] = {"output": True}
+    builtin_dict["pedersen"] = PedersenInstanceDef(
+        ratio=ratios.get("pedersen"),
+        repetitions=1,
+        element_height=256,
+        element_bits=252,
+        n_inputs=2,
+        hash_limit=PRIME,
+    )
+    builtin_dict["range_check"] = RangeCheckInstanceDef(
+        ratio=ratios.get("range_check"),
+        ratio_den=1,
+        n_parts=8,
+    )
+    builtin_dict["ecdsa"] = EcdsaInstanceDef(
+        ratio=ratios.get("ecdsa"),
+        repetitions=1,
+        height=256,
+        n_hash_bits=251,
+    )
+    builtin_dict["bitwise"] = BitwiseInstanceDef(
+        ratio=ratios.get("bitwise"),
+        total_n_bits=251,
+    )
+    builtin_dict["ec_op"] = EcOpInstanceDef(
+        ratio=ratios.get("ec_op"),
+        scalar_height=256,
+        scalar_bits=252,
+        scalar_limit=PRIME,
+    )
+    builtin_dict["keccak"] = KeccakInstanceDef(
+        ratio=ratios.get("keccak"),
+        state_rep=[200] * 8,
+        instances_per_component=16,
+    )
+    builtin_dict["poseidon"] = PoseidonInstanceDef(
+        ratio=ratios.get("poseidon"),
+        partial_rounds_partition=[64, 22],
     )
 
+    add_mod_den, mul_mod_den, range_check96_den = [
+        ratios.get(builtin + "_den", 1) for builtin in ["add_mod", "mul_mod", "range_check96"]
+    ]
+    assert (
+        isinstance(add_mod_den, int)
+        and isinstance(mul_mod_den, int)
+        and isinstance(range_check96_den, int)
+    ), "denominators may not be None"
 
-def build_dynamic_layout(**ratios: Optional[int]) -> CairoLayout:
+    builtin_dict["range_check96"] = RangeCheckInstanceDef(
+        ratio=ratios.get("range_check96"),
+        ratio_den=range_check96_den,
+        n_parts=6,
+    )
+
+    builtin_dict["add_mod"] = AddModInstanceDef(
+        word_bit_len=96,
+        n_words=4,
+        batch_size=1,
+        ratio=ratios.get("add_mod"),
+        ratio_den=add_mod_den,
+    )
+
+    builtin_dict["mul_mod"] = MulModInstanceDef(
+        word_bit_len=96,
+        n_words=4,
+        batch_size=1,
+        ratio=ratios.get("mul_mod"),
+        ratio_den=mul_mod_den,
+    )
+
+    return builtin_dict
+
+
+BATCH_SIZES: Dict[str, int] = {
+    "keccak": KECCAK_BATCH_SIZE,
+}
+
+
+def get_implemented_size_per_builtin(builtin_name: str, requested_usage: int = 0) -> int:
+    batch_size = BATCH_SIZES.get(builtin_name, 1)
+    return batch_size * div_ceil(requested_usage, batch_size)
+
+
+DYNAMIC_DILUTED_SPACING = 4
+DYNAMIC_DILUTED_N_BITS = 16
+DYNAMIC_PUBLIC_MEMORY_FRACTION = 8
+
+
+def build_dynamic_layout(
+    log_diluted_units_per_step: Optional[int] = None,
+    cpu_component_step: Optional[int] = None,
+    rc_units: Optional[int] = None,
+    memory_units_per_step: Optional[int] = None,
+    **ratios: Optional[int],
+) -> CairoLayout:
+    if len(ratios) != 0:
+        for builtin_name in SUPPORTED_DYNAMIC_BUILTINS.except_for(OUTPUT_BUILTIN):
+            if builtin_name not in ratios:
+                ratios[builtin_name] = 0
+
     return CairoLayout(
         layout_name=DYNAMIC_LAYOUT_NAME,
-        cpu_component_step=1,
-        rc_units=16,
+        cpu_component_step=cpu_component_step,
+        rc_units=rc_units,
         builtins=build_builtins_dict_with_default_params(**ratios),
-        public_memory_fraction=8,
-        memory_units_per_step=8,
+        public_memory_fraction=DYNAMIC_PUBLIC_MEMORY_FRACTION,
+        memory_units_per_step=memory_units_per_step,
         diluted_pool_instance_def=DilutedPoolInstanceDef(
-            log_units_per_step=4,
-            spacing=4,
-            n_bits=16,
+            log_units_per_step=log_diluted_units_per_step,
+            spacing=DYNAMIC_DILUTED_SPACING,
+            n_bits=DYNAMIC_DILUTED_N_BITS,
         ),
-        n_trace_columns=73,
+        n_trace_columns=None,
     )
 
-
-dynamic_template_instance = build_dynamic_layout()
 
 plain_instance = CairoLayout(
     layout_name="plain",
@@ -162,6 +239,7 @@ small_instance = CairoLayout(
         ),
         range_check=RangeCheckInstanceDef(
             ratio=8,
+            ratio_den=1,
             n_parts=8,
         ),
         ecdsa=EcdsaInstanceDef(
@@ -189,6 +267,7 @@ dex_instance = CairoLayout(
         ),
         range_check=RangeCheckInstanceDef(
             ratio=8,
+            ratio_den=1,
             n_parts=8,
         ),
         ecdsa=EcdsaInstanceDef(
@@ -221,6 +300,7 @@ starknet_instance = CairoLayout(
         ),
         range_check=RangeCheckInstanceDef(
             ratio=16,
+            ratio_den=1,
             n_parts=8,
         ),
         ecdsa=EcdsaInstanceDef(
@@ -267,6 +347,7 @@ starknet_with_keccak_instance = CairoLayout(
         ),
         range_check=RangeCheckInstanceDef(
             ratio=16,
+            ratio_den=1,
             n_parts=8,
         ),
         ecdsa=EcdsaInstanceDef(
@@ -298,7 +379,7 @@ starknet_with_keccak_instance = CairoLayout(
     n_trace_columns=15,
 )
 
-# A layout for a Cairo verification proof.
+# Layouts for a Cairo verification proof.
 recursive_instance = CairoLayout(
     layout_name="recursive",
     rc_units=4,
@@ -320,6 +401,7 @@ recursive_instance = CairoLayout(
         ),
         range_check=RangeCheckInstanceDef(
             ratio=8,
+            ratio_den=1,
             n_parts=8,
         ),
         bitwise=BitwiseInstanceDef(
@@ -328,6 +410,42 @@ recursive_instance = CairoLayout(
         ),
     ),
     n_trace_columns=10,
+)
+
+recursive_with_poseidon_instance = CairoLayout(
+    layout_name="recursive_with_poseidon",
+    rc_units=4,
+    public_memory_fraction=8,
+    diluted_pool_instance_def=DilutedPoolInstanceDef(
+        log_units_per_step=3,
+        spacing=4,
+        n_bits=16,
+    ),
+    builtins=dict(
+        output=True,
+        pedersen=PedersenInstanceDef(
+            ratio=256,
+            repetitions=1,
+            element_height=256,
+            element_bits=252,
+            n_inputs=2,
+            hash_limit=PRIME,
+        ),
+        range_check=RangeCheckInstanceDef(
+            ratio=16,
+            ratio_den=1,
+            n_parts=8,
+        ),
+        bitwise=BitwiseInstanceDef(
+            ratio=16,
+            total_n_bits=251,
+        ),
+        poseidon=PoseidonInstanceDef(
+            ratio=64,
+            partial_rounds_partition=[64, 22],
+        ),
+    ),
+    n_trace_columns=8,
 )
 
 # A layout with a lot of bitwise and pedersen instances (e.g., for Cairo stark verification
@@ -344,7 +462,7 @@ recursive_large_output_instance = CairoLayout(
     builtins=dict(
         output=True,
         pedersen=PedersenInstanceDef(
-            ratio=32,
+            ratio=128,
             repetitions=1,
             element_height=256,
             element_bits=252,
@@ -353,20 +471,25 @@ recursive_large_output_instance = CairoLayout(
         ),
         range_check=RangeCheckInstanceDef(
             ratio=8,
+            ratio_den=1,
             n_parts=8,
         ),
         bitwise=BitwiseInstanceDef(
             ratio=8,
             total_n_bits=251,
         ),
+        poseidon=PoseidonInstanceDef(
+            ratio=8,
+            partial_rounds_partition=[64, 22],
+        ),
     ),
-    n_trace_columns=13,
+    n_trace_columns=12,
 )
 
 # A layout optimized for a cairo verifier program that is being verified by a cairo verifier.
 all_cairo_instance = CairoLayout(
     layout_name="all_cairo",
-    rc_units=4,
+    rc_units=8,
     public_memory_fraction=8,
     diluted_pool_instance_def=DilutedPoolInstanceDef(
         log_units_per_step=4,
@@ -385,6 +508,7 @@ all_cairo_instance = CairoLayout(
         ),
         range_check=RangeCheckInstanceDef(
             ratio=8,
+            ratio_den=1,
             n_parts=8,
         ),
         ecdsa=EcdsaInstanceDef(
@@ -412,8 +536,15 @@ all_cairo_instance = CairoLayout(
             ratio=256,
             partial_rounds_partition=[64, 22],
         ),
+        range_check96=RangeCheckInstanceDef(
+            ratio=8,
+            ratio_den=1,
+            n_parts=6,
+        ),
+        add_mod=AddModInstanceDef(word_bit_len=96, n_words=4, batch_size=1, ratio=128, ratio_den=1),
+        mul_mod=MulModInstanceDef(word_bit_len=96, n_words=4, batch_size=1, ratio=256, ratio_den=1),
     ),
-    n_trace_columns=11,
+    n_trace_columns=12,
 )
 
 all_solidity_instance = CairoLayout(
@@ -437,6 +568,7 @@ all_solidity_instance = CairoLayout(
         ),
         range_check=RangeCheckInstanceDef(
             ratio=8,
+            ratio_den=1,
             n_parts=8,
         ),
         ecdsa=EcdsaInstanceDef(
@@ -459,6 +591,8 @@ all_solidity_instance = CairoLayout(
     n_trace_columns=27,
 )
 
+dynamic_instance = build_dynamic_layout()
+
 LAYOUTS: Dict[str, CairoLayout] = {
     "plain": plain_instance,
     "small": small_instance,
@@ -468,4 +602,6 @@ LAYOUTS: Dict[str, CairoLayout] = {
     "recursive_large_output": recursive_large_output_instance,
     "all_solidity": all_solidity_instance,
     "starknet_with_keccak": starknet_with_keccak_instance,
+    "dynamic": dynamic_instance,
+    "recursive_with_poseidon": recursive_with_poseidon_instance,
 }

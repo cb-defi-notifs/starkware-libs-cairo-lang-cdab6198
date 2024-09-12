@@ -1,5 +1,36 @@
-load("//bazel_utils/python:defs.bzl", "requirement")
 load("//bazel_utils:python.bzl", "pytest_test")
+load("//src/starkware/cairo/lang:cairo_rules.bzl", "cairo_library")
+
+pytest_test(
+    name = "starkware_cairo_stark_verifier_air_public_input_test",
+    srcs = [
+        "public_input_test.py",
+    ],
+    data = [
+        "example_expected.json",
+        "example_proof.json",
+        "//src/starkware/cairo/stark_verifier/air:cairo",
+        "//src/starkware/cairo/stark_verifier/air:dynamic_layout_proof.json",
+        "//src/starkware/cairo/stark_verifier/core:air_interface.cairo",
+        "//src/starkware/cairo/stark_verifier/core:channel.cairo",
+        "//src/starkware/cairo/stark_verifier/core:domains.cairo",
+        "//src/starkware/cairo/stark_verifier/core:stark",
+        "//src/starkware/cairo/stark_verifier/core:table_commitment.cairo",
+        "//src/starkware/cairo/stark_verifier/core:vector_commitment.cairo",
+        "//src/starkware/cairo/stark_verifier/core/fri",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":python",
+        "//src/starkware/cairo/common:cairo_common_lib",
+        "//src/starkware/cairo/common:cairo_common_validate_utils_lib",
+        "//src/starkware/cairo/common:cairo_function_runner_lib",
+        "//src/starkware/cairo/lang:cairo_constants_lib",
+        "//src/starkware/cairo/lang/compiler:cairo_compile_lib",
+        "//src/starkware/cairo/lang/vm:cairo_vm_lib",
+        "//src/starkware/python:starkware_python_utils_lib",
+    ],
+)
 
 py_library(
     name = "starkware_cairo_stark_verifier_air_test_base_lib",
@@ -8,18 +39,17 @@ py_library(
     ],
     data = [
         "example_proof.json",
+        "//src/starkware/cairo/stark_verifier/air/layouts/starknet_with_keccak",
+        "//src/starkware/cairo/stark_verifier/core:stark",
+        "//src/starkware/cairo/stark_verifier/core/fri",
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "starkware_cairo_stark_verifier_air_lib",
-        "//src/starkware/cairo/common:cairo_common_lib",
+        ":python",
         "//src/starkware/cairo/common:cairo_common_validate_utils_lib",
         "//src/starkware/cairo/common:cairo_function_runner_lib",
+        "//src/starkware/cairo/lang:cairo_constants_lib",
         "//src/starkware/cairo/lang/compiler:cairo_compile_lib",
-        "//src/starkware/cairo/stark_verifier/air/layouts:starkware_cairo_stark_verifier_air_starknet_with_keccak_lib",
-        "//src/starkware/cairo/stark_verifier/core:starkware_cairo_stark_verifier_core_stark_lib",
-        "//src/starkware/python:starkware_python_utils_lib",
-        requirement("eth_hash"),
     ],
 )
 
@@ -30,14 +60,11 @@ exports_files(glob([
     "*.json",
 ]))
 
-py_library(
-    name = "starkware_cairo_stark_verifier_air_lib",
+cairo_library(
+    name = "cairo",
     srcs = [
-        "parser.py",
-        "utils.py",
-    ],
-    data = [
-        "config.cairo",
+        "config_instances.cairo",
+        "config_interface.cairo",
         "diluted.cairo",
         "layout.cairo",
         "oods.cairo",
@@ -48,7 +75,25 @@ py_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "//src/starkware/cairo/stark_verifier/core:starkware_cairo_stark_verifier_core_stark_lib",
+        "//src/starkware/cairo/common:cairo_common_cairo_lib",
+        "//src/starkware/cairo/stark_verifier/core:cairo",
+        "//src/starkware/cairo/stark_verifier/core:serialize",
+    ],
+)
+
+py_library(
+    name = "python",
+    srcs = [
+        "parser.py",
+        "utils.py",
+    ],
+    data = [":cairo"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/starkware/cairo/common:cairo_common_lib",
+        "//src/starkware/cairo/lang/compiler:cairo_compile_lib",
+        "//src/starkware/cairo/lang/vm:cairo_vm_lib",
+        "//src/starkware/python:starkware_python_utils_lib",
     ],
 )
 
@@ -58,7 +103,5 @@ pytest_test(
         "stark_test.py",
     ],
     visibility = ["//visibility:public"],
-    deps = [
-        "starkware_cairo_stark_verifier_air_test_base_lib",
-    ],
+    deps = [":starkware_cairo_stark_verifier_air_test_base_lib"],
 )

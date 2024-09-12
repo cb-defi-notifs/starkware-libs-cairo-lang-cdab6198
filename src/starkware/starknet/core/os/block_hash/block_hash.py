@@ -1,31 +1,44 @@
-import asyncio
-import functools
-from typing import Callable, Iterable, List, Sequence
+import dataclasses
+from typing import Callable, Iterable, List, Sequence, Tuple
 
-from starkware.cairo.common.hash_state import compute_hash_on_elements
+from starkware.cairo.common.hash_state import (
+    compute_hash_on_elements,
+    compute_hash_on_elements_without_length,
+)
 from starkware.cairo.lang.vm.crypto import pedersen_hash
-from starkware.python.utils import from_bytes, safe_zip, to_bytes
-from starkware.starknet.definitions.general_config import StarknetGeneralConfig
+from starkware.python.utils import from_bytes, process_concurrently, safe_zip, to_bytes
+from starkware.starknet.definitions import constants
 from starkware.starkware_utils.commitment_tree.patricia_tree.patricia_tree import PatriciaTree
 from starkware.storage.dict_storage import DictStorage
 from starkware.storage.storage import FactFetchingContext
 from starkware.storage.storage_utils import SimpleLeafFact
 
+BlockHash = int
+BlockHashWithoutParent = int
+
+
+@dataclasses.dataclass(frozen=True)
+class BlockCommitments:
+    tx_commitment: int
+    event_commitment: int
+
+
+BLOCK_HASH_N_ELEMENTS = 11
+
 
 async def calculate_block_hash(
-    general_config: StarknetGeneralConfig,
-    parent_hash: int,
+    parent_hash: BlockHash,
     block_number: int,
-    global_state_root: bytes,
+    global_state_root: int,
     sequencer_address: int,
     block_timestamp: int,
     tx_hashes: Sequence[int],
     tx_signatures: Sequence[List[int]],
     event_hashes: Sequence[int],
     hash_function: Callable[[int, int], int] = pedersen_hash,
-) -> int:
+) -> Tuple[BlockHash, BlockCommitments]:
     """
-    Calculates the block hash in the StarkNet network.
+    Calculates the block hash in the Starknet network.
     The block hash is a hash chain of the following information:
         1. Parent block hash.
         2. Block number.
@@ -41,6 +54,46 @@ async def calculate_block_hash(
     Each hash chain computation begins with 0 as initialization and ends with its length appended.
     The length is appended in order to avoid collisions of the following kind:
     H([x,y,z]) = h(h(x,y),z) = H([w, z]) where w = h(x,y).
+
+    Returns the block hash, the transaction commitment and the event commitment.
+    """
+    block_hash_without_parent, commitments = await calculate_block_hash_without_parent(
+        block_number=block_number,
+        global_state_root=global_state_root,
+        sequencer_address=sequencer_address,
+        block_timestamp=block_timestamp,
+        tx_hashes=tx_hashes,
+        tx_signatures=tx_signatures,
+        event_hashes=event_hashes,
+        hash_function=hash_function,
+    )
+
+    block_hash = finalize_block_hash(
+        block_hash_without_parent=block_hash_without_parent,
+        parent_hash=parent_hash,
+        hash_function=hash_function,
+    )
+    return block_hash, BlockCommitments(
+        tx_commitment=commitments.tx_commitment, event_commitment=commitments.event_commitment
+    )
+
+
+async def calculate_block_hash_without_parent(
+    block_number: int,
+    global_state_root: int,
+    sequencer_address: int,
+    block_timestamp: int,
+    tx_hashes: Sequence[int],
+    tx_signatures: Sequence[List[int]],
+    event_hashes: Sequence[int],
+    hash_function: Callable[[int, int], int] = pedersen_hash,
+) -> Tuple[BlockHashWithoutParent, BlockCommitments]:
+    """
+    Hashes the prefix of the block hash chain, excluding the parent block hash
+    and the total number of elements in the chain.
+    See calculate_block_hash documentation for more details.
+
+    Returns the hash, the transaction commitment and the event commitment.
     """
 
     def bytes_hash_function(x: bytes, y: bytes) -> bytes:
@@ -48,71 +101,85 @@ async def calculate_block_hash(
 
     ffc = FactFetchingContext(storage=DictStorage(), hash_func=bytes_hash_function)
 
-    # Include signatures in transaction hashes on a separate thread (due to it being CPU-intensive).
-    calculate_tx_hashes = functools.partial(
-        calculate_tx_hashes_with_signatures,
-        tx_hashes=tx_hashes,
-        tx_signatures=tx_signatures,
-        hash_function=hash_function,
+    # Include signatures in transaction hashes.
+    tx_final_hashes = await calculate_tx_hashes_with_signatures(
+        tx_hashes=tx_hashes, tx_signatures=tx_signatures, hash_function=hash_function
     )
-    tx_final_hashes = await asyncio.get_event_loop().run_in_executor(None, calculate_tx_hashes)
 
     # Calculate transaction commitment.
     tx_commitment = await calculate_patricia_root(
         leaves=tx_final_hashes,
-        height=general_config.tx_commitment_tree_height,
+        height=constants.TRANSACTION_COMMITMENT_TREE_HEIGHT,
         ffc=ffc,
     )
 
     event_commitment = await calculate_patricia_root(
-        leaves=event_hashes, height=general_config.event_commitment_tree_height, ffc=ffc
+        leaves=event_hashes, height=constants.EVENT_COMMITMENT_TREE_HEIGHT, ffc=ffc
     )
 
-    return compute_hash_on_elements(
-        data=[
-            block_number,
-            from_bytes(global_state_root),
-            sequencer_address,
-            block_timestamp,
-            len(tx_hashes),  # Number of transactions.
-            tx_commitment,  # Transaction commitment.
-            len(event_hashes),  # Number of events.
-            event_commitment,  # Event commitment.
-            0,  # Protocol version.
-            0,  # Extra data.
-            # Must be last for future optimization; that way we can separate the calculation of all
-            # the other fields, which depend on the block itself, from the parent block hash,
-            # as the hash is calculated in the following order: H([x,y,z]) = h(h(x,y),z).
-            parent_hash,
-        ],
-        hash_func=hash_function,
+    data = [
+        block_number,
+        global_state_root,
+        sequencer_address,
+        block_timestamp,
+        len(tx_hashes),  # Number of transactions.
+        tx_commitment,  # Transaction commitment.
+        len(event_hashes),  # Number of events.
+        event_commitment,  # Event commitment.
+        0,  # Protocol version.
+        0,  # Extra data.
+    ]
+    assert len(data) == BLOCK_HASH_N_ELEMENTS - 1, (
+        f"Unexpected number of block hash elements; got {len(data) + 1}; "
+        f"expected {BLOCK_HASH_N_ELEMENTS}."
+    )
+
+    # Hash all block hash members except parent_hash and the number of hash members.
+    block_hash_without_parent = compute_hash_on_elements_without_length(
+        data=data, hash_func=hash_function
+    )
+    return block_hash_without_parent, BlockCommitments(
+        tx_commitment=tx_commitment, event_commitment=event_commitment
     )
 
 
-def calculate_tx_hashes_with_signatures(
+def finalize_block_hash(
+    block_hash_without_parent: BlockHashWithoutParent,
+    parent_hash: BlockHash,
+    hash_function: Callable[[int, int], int] = pedersen_hash,
+) -> BlockHash:
+    """
+    Completes the block hash calculation by hashing prefix hash with the parent hash, and the
+    total number of block hash elements.
+    """
+    return hash_function(
+        hash_function(block_hash_without_parent, parent_hash), BLOCK_HASH_N_ELEMENTS
+    )
+
+
+async def calculate_tx_hashes_with_signatures(
     tx_hashes: Iterable[int],
     tx_signatures: Iterable[List[int]],
     hash_function: Callable[[int, int], int],
 ) -> Iterable[int]:
-    return (
-        calculate_single_tx_hash_with_signature(
-            tx_hash=tx_hash, tx_signature=tx_signature, hash_function=hash_function
-        )
-        for (tx_hash, tx_signature) in safe_zip(tx_hashes, tx_signatures)
+    """
+    Hashes the signature with the transaction hash, for every transaction, to get hash that
+    takes into account the entire transaction, as the original hash does not include the
+    signature.
+    """
+
+    def calculate_single_tx_hash_with_signature(
+        tx_hash_signature_pair: Tuple[int, List[int]],
+    ) -> int:
+        tx_hash, tx_signature = tx_hash_signature_pair
+        signature_hash = compute_hash_on_elements(data=tx_signature, hash_func=hash_function)
+        return hash_function(tx_hash, signature_hash)
+
+    return await process_concurrently(
+        func=calculate_single_tx_hash_with_signature,
+        items=list(safe_zip(tx_hashes, tx_signatures)),
+        n_chunks=32,
     )
-
-
-def calculate_single_tx_hash_with_signature(
-    tx_hash: int,
-    tx_signature: List[int],
-    hash_function: Callable[[int, int], int],
-) -> int:
-    """
-    Hashes the signature with the given transaction hash, to get a hash that takes into account the
-    entire transaction, as the original hash does not include the signature.
-    """
-    signature_hash = compute_hash_on_elements(data=tx_signature, hash_func=hash_function)
-    return hash_function(tx_hash, signature_hash)
 
 
 async def calculate_patricia_root(
@@ -125,7 +192,7 @@ async def calculate_patricia_root(
         ffc=ffc, height=height, leaf_fact=SimpleLeafFact.empty()
     )
     modifications = [(index, SimpleLeafFact(value=value)) for index, value in enumerate(leaves)]
-    final_tree = await empty_tree.update(ffc=ffc, modifications=modifications)
+    final_tree = await empty_tree.update_efficiently(ffc=ffc, modifications=modifications)
 
     return from_bytes(final_tree.root)
 

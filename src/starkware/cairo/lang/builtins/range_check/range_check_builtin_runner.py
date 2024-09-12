@@ -1,22 +1,29 @@
 from typing import Any, Dict, Optional, Tuple
 
-from starkware.cairo.lang.vm.builtin_runner import BuiltinVerifier, SimpleBuiltinRunner
+from starkware.cairo.lang.builtins.range_check.instance_def import RangeCheckInstanceDef
+from starkware.cairo.lang.vm.builtin_runner import BuiltinVerifier, SimpleBuiltinRunnerWithLowRatio
 from starkware.cairo.lang.vm.relocatable import RelocatableValue
 from starkware.python.math_utils import safe_div
 
 
-class RangeCheckBuiltinRunner(SimpleBuiltinRunner):
-    def __init__(self, included: bool, ratio, inner_rc_bound, n_parts):
+class RangeCheckBuiltinRunner(SimpleBuiltinRunnerWithLowRatio):
+    def __init__(self, name: str, included: bool, ratio, ratio_den, inner_rc_bound, n_parts):
         super().__init__(
-            name="range_check",
+            name=name,
             included=included,
             ratio=ratio,
             cells_per_instance=1,
             n_input_cells=1,
+            ratio_den=ratio_den,
         )
         self.inner_rc_bound = inner_rc_bound
         self.bound = inner_rc_bound**n_parts
         self.n_parts = n_parts
+
+    def get_instance_def(self):
+        return RangeCheckInstanceDef(
+            ratio=self.ratio, ratio_den=self.ratio_den, n_parts=self.n_parts
+        )
 
     def add_validation_rules(self, runner):
         def rule(memory, addr):
@@ -50,7 +57,7 @@ class RangeCheckBuiltinRunner(SimpleBuiltinRunner):
             assert isinstance(val, int)
             res[idx] = {"index": idx, "value": hex(val)}
 
-        return {"range_check": sorted(res.values(), key=lambda item: item["index"])}
+        return {self.name: sorted(res.values(), key=lambda item: item["index"])}
 
     def get_range_check_usage(self, runner) -> Optional[Tuple[int, int]]:
         assert self.base is not None, "Uninitialized self.base."
@@ -84,7 +91,8 @@ class RangeCheckBuiltinRunner(SimpleBuiltinRunner):
 
 
 class RangeCheckBuiltinVerifier(BuiltinVerifier):
-    def __init__(self, included: bool, ratio):
+    def __init__(self, name: str, included: bool, ratio):
+        self.name = name
         self.included = included
         self.ratio = ratio
 
@@ -92,7 +100,7 @@ class RangeCheckBuiltinVerifier(BuiltinVerifier):
         if not self.included:
             return [], []
 
-        addresses = public_input.memory_segments["range_check"]
+        addresses = public_input.memory_segments[self.name]
         max_size = safe_div(public_input.n_steps, self.ratio)
         assert (
             0

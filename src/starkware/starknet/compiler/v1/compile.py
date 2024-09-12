@@ -1,23 +1,18 @@
 import json
 import os
+import resource
 import subprocess
 import tempfile
 from typing import Any, Dict, List, Optional
 
 import shlex
 
+from starkware.starknet.compiler.v1.compiler_exe_paths import (
+    STARKNET_COMPILE_EXE,
+    STARKNET_SIERRA_COMPILE_EXE,
+)
 from starkware.starknet.definitions.error_codes import StarknetErrorCode
 from starkware.starkware_utils.error_handling import StarkException
-
-if "RUNFILES_DIR" in os.environ:
-    from bazel_tools.tools.python.runfiles import runfiles
-
-    r = runfiles.Create()
-
-    COMPILER_DIR = r.Rlocation("cairo-compiler-archive-2.0.0/bin")
-else:
-    COMPILER_DIR = os.path.join(os.path.dirname(__file__), "bin")
-
 
 JsonObject = Dict[str, Any]
 
@@ -32,6 +27,7 @@ def build_sierra_to_casm_compilation_args(
     compiler_args: Optional[str] = None,
     allowed_libfuncs_list_name: Optional[str] = None,
     allowed_libfuncs_list_file: Optional[str] = None,
+    max_bytecode_size: Optional[int] = None,
 ) -> List[str]:
     """
     Returns the compilation arguments for a given starknet contract.
@@ -50,6 +46,9 @@ def build_sierra_to_casm_compilation_args(
 
     if add_pythonic_hints:
         additional_args.append("--add-pythonic-hints")
+
+    if max_bytecode_size is not None:
+        additional_args.append(f"--max-bytecode-size={max_bytecode_size}")
 
     additional_args += build_allowed_libfuncs_args(
         allowed_libfuncs_list_name=allowed_libfuncs_list_name,
@@ -82,6 +81,7 @@ def compile_cairo_to_sierra(
     cairo_path: str,
     allowed_libfuncs_list_name: Optional[str] = None,
     allowed_libfuncs_list_file: Optional[str] = None,
+    single_file: bool = True,
 ) -> JsonObject:
     """
     Compiles a Starknet Cairo 1.0 contract; returns the resulting Sierra as json.
@@ -90,9 +90,10 @@ def compile_cairo_to_sierra(
         allowed_libfuncs_list_name=allowed_libfuncs_list_name,
         allowed_libfuncs_list_file=allowed_libfuncs_list_file,
     )
+    if single_file:
+        additional_args += ["--single-file"]
 
-    starknet_compile = os.path.join(COMPILER_DIR, "starknet-compile")
-    command = [starknet_compile, cairo_path, *additional_args]
+    command = [STARKNET_COMPILE_EXE, cairo_path, *additional_args]
     return run_compile_command(command=command)
 
 
@@ -103,23 +104,28 @@ def compile_sierra_to_casm(
     allowed_libfuncs_list_name: Optional[str] = None,
     allowed_libfuncs_list_file: Optional[str] = None,
     compiler_dir: Optional[str] = None,
+    memory_limit_in_mb: Optional[int] = None,
+    max_bytecode_size: Optional[int] = None,
 ) -> JsonObject:
     """
     Compiles a Starknet Sierra contract.
     If compiler_path is None, uses a default compiler.
     Returns the resulting Casm as json.
     """
-    compiler_dir = COMPILER_DIR if compiler_dir is None else compiler_dir
-    compiler_path = os.path.join(compiler_dir, "starknet-sierra-compile")
+    if compiler_dir is None:
+        compiler_path = STARKNET_SIERRA_COMPILE_EXE
+    else:
+        compiler_path = os.path.join(compiler_dir, "starknet-sierra-compile")
     additional_args = build_sierra_to_casm_compilation_args(
         compiler_args=compiler_args,
         add_pythonic_hints=add_pythonic_hints,
         allowed_libfuncs_list_name=allowed_libfuncs_list_name,
         allowed_libfuncs_list_file=allowed_libfuncs_list_file,
+        max_bytecode_size=max_bytecode_size,
     )
 
     command = [compiler_path, sierra_path, *additional_args]
-    return run_compile_command(command=command)
+    return run_compile_command(command=command, memory_limit_in_mb=memory_limit_in_mb)
 
 
 def compile_cairo_to_casm(
@@ -147,9 +153,21 @@ def compile_cairo_to_casm(
         )
 
 
-def run_compile_command(command: List[str]) -> JsonObject:
+def set_memory_limit(memory_limit_in_mb: Optional[int]):
+    if not memory_limit_in_mb:
+        limit_in_bytes = resource.RLIM_INFINITY
+    else:
+        limit_in_bytes = memory_limit_in_mb * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (limit_in_bytes, resource.RLIM_INFINITY))
+
+
+def run_compile_command(command: List[str], memory_limit_in_mb: Optional[int] = None) -> JsonObject:
     try:
-        result: subprocess.CompletedProcess = subprocess.run(command, capture_output=True)
+        result: subprocess.CompletedProcess = subprocess.run(
+            command,
+            preexec_fn=(lambda: set_memory_limit(memory_limit_in_mb=memory_limit_in_mb)),
+            capture_output=True,
+        )
     except subprocess.CalledProcessError:
         # The inner command is responsible for printing the error message. No need to print the
         # stack trace of this script.

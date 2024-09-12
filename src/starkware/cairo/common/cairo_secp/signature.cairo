@@ -3,16 +3,17 @@ from starkware.cairo.common.cairo_builtins import BitwiseBuiltin
 from starkware.cairo.common.cairo_keccak.keccak import cairo_keccak_uint256s_bigend, finalize_keccak
 from starkware.cairo.common.cairo_secp.bigint import (
     BASE,
-    BigInt3,
-    UnreducedBigInt3,
     bigint_mul,
     bigint_to_uint256,
     nondet_bigint3,
     uint256_to_bigint,
 )
+from starkware.cairo.common.cairo_secp.bigint3 import BigInt3, UnreducedBigInt3
 from starkware.cairo.common.cairo_secp.constants import BETA, N0, N1, N2
-from starkware.cairo.common.cairo_secp.ec import EcPoint, ec_add, ec_mul, ec_negate
+from starkware.cairo.common.cairo_secp.ec import ec_add, ec_mul, ec_negate
+from starkware.cairo.common.cairo_secp.ec_point import EcPoint
 from starkware.cairo.common.cairo_secp.field import (
+    is_zero,
     reduce,
     unreduced_mul,
     unreduced_sqr,
@@ -129,6 +130,25 @@ func public_key_point_to_eth_address{
     return (eth_address=point_hash.low + RC_BOUND * high_low);
 }
 
+// Returns 1 if (x, y) is a point on the secp256k1 curve and 0 otherwise.
+//
+// Prover assumption: the limbs of x and y are in the range (-2**87.49, 2**87.49).
+// Soundness assumption: the limbs of x and y are in the range (-2**106.99, 2**106.99).
+func is_on_curve{range_check_ptr}(x: BigInt3, y: BigInt3) -> (res: felt) {
+    let (x_square: UnreducedBigInt3) = unreduced_sqr(x);
+    let (x_square_reduced: BigInt3) = reduce(x_square);
+    let (x_cube: UnreducedBigInt3) = unreduced_mul(x, x_square_reduced);
+    let (y_square: UnreducedBigInt3) = unreduced_sqr(y);
+
+    let diff = UnreducedBigInt3(
+        d0=x_cube.d0 + BETA - y_square.d0, d1=x_cube.d1 - y_square.d1, d2=x_cube.d2 - y_square.d2
+    );
+
+    let (reduced_diff) = reduce(diff);
+
+    return is_zero(reduced_diff);
+}
+
 // Returns a point on the secp256k1 curve with the given x coordinate. Chooses the y that has the
 //   same parity as v (there are two y values that correspond to x, with different parities).
 // Also verifies that v is in the range [0, 2 ** 128).
@@ -176,6 +196,80 @@ func get_point_from_x{range_check_ptr}(x: BigInt3, v: felt) -> (point: EcPoint) 
     );
 
     return (point=EcPoint(x, y));
+}
+
+// Similar to `get_point_from_x`, but handles the case that 'x' does correspond to a point on the
+// curve gracefully.
+// If the point is on the curve, `true` is returned and the point is written to `result`,
+// Otherwise `false` is returned and nothing is written to `result`.
+//
+// The y coordinate of the result is guaranteed to be in reduced form (less than the secp256k1
+// prime).
+//
+// Prover assumptions:
+//   * The limbs of x are in the range (-2**87.99, 2**87.99).
+// Soundness assumptions:
+//   * The limbs of x are in the range (-2**106.99, 2**106.99).
+func try_get_point_from_x{range_check_ptr}(x: BigInt3, v: felt, result: EcPoint*) -> (
+    is_on_curve: felt
+) {
+    alloc_locals;
+    with_attr error_message("Out of range v {v}.") {
+        assert_nn(v);
+    }
+    let (x_square: UnreducedBigInt3) = unreduced_sqr(x);
+    let (x_square_reduced: BigInt3) = reduce(x_square);
+    let (x_cube: UnreducedBigInt3) = unreduced_mul(x, x_square_reduced);
+
+    %{
+        from starkware.cairo.common.cairo_secp.secp_utils import SECP_P, pack
+
+        x_cube_int = pack(ids.x_cube, PRIME) % SECP_P
+        y_square_int = (x_cube_int + ids.BETA) % SECP_P
+        y = pow(y_square_int, (SECP_P + 1) // 4, SECP_P)
+
+        # We need to decide whether to take y or SECP_P - y.
+        if ids.v % 2 == y % 2:
+            value = y
+        else:
+            value = (-y) % SECP_P
+    %}
+
+    let (y: BigInt3) = nondet_bigint3();
+    let (y_square: UnreducedBigInt3) = unreduced_sqr(y);
+
+    local is_on_curve;
+    %{ ids.is_on_curve = (y * y) % SECP_P == y_square_int %}
+    if (is_on_curve != 0) {
+        // Check that y has same parity as v.
+        validate_reduced_field_element(y);
+        assert_nn((y.d0 + v) / 2);
+
+        // Check that y_square = x_cube + BETA.
+        verify_zero(
+            UnreducedBigInt3(
+                d0=x_cube.d0 + BETA - y_square.d0,
+                d1=x_cube.d1 - y_square.d1,
+                d2=x_cube.d2 - y_square.d2,
+            ),
+        );
+
+        assert [result] = EcPoint(x, y);
+        return (is_on_curve=1);
+    } else {
+        // Check that y_square = -(x_cube + BETA).
+        // Since (SECP_P - 1) % 4 != 0, (-1) is not a square.
+        // This implies that (x_cube + BETA) does not have a square root.
+        verify_zero(
+            UnreducedBigInt3(
+                d0=x_cube.d0 + BETA + y_square.d0,
+                d1=x_cube.d1 + y_square.d1,
+                d2=x_cube.d2 + y_square.d2,
+            ),
+        );
+
+        return (is_on_curve=0);
+    }
 }
 
 // Receives a signature and the signed message hash.

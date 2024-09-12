@@ -3,15 +3,17 @@ import functools
 import re
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Callable, Dict, Type
+from typing import Any, Callable, Dict, Optional, Tuple, Type
 
+import marshmallow
+import marshmallow.exceptions
 import marshmallow.fields as mfields
+import marshmallow.utils
 from frozendict import frozendict
-from marshmallow import ValidationError
 from marshmallow.base import FieldABC
 from mypy_extensions import KwArg, VarArg
 
-from starkware.python.utils import from_bytes
+from starkware.python.utils import from_bytes, to_bytes
 from starkware.starkware_utils.custom_raising_dict import CustomRaisingDict, CustomRaisingFrozenDict
 
 FieldMetadata = Dict[str, Any]
@@ -31,7 +33,6 @@ StrictRequiredInteger: Callable[[VarArg(), KwArg()], mfields.Integer] = functool
 StrictOptionalInteger: Callable[[VarArg(), KwArg()], mfields.Integer] = functools.partial(
     mfields.Integer, strict=True, allow_none=True
 )
-
 
 # Class definitions.
 
@@ -63,10 +64,21 @@ class EnumField(mfields.Field):
     """
 
     def __init__(
-        self, enum_cls: Type[Enum], required: bool = False, allow_none: bool = False, **kwargs
+        self,
+        enum_cls: Type[Enum],
+        required: Optional[bool] = None,
+        allow_none: Optional[bool] = None,
+        load_default: Optional[Enum] = None,
+        **kwargs,
     ):
         self.enum_cls = enum_cls
-        super().__init__(required=required, allow_none=allow_none, **kwargs)
+        super().__init__(
+            required=True if required is None else required,
+            # If `load_default` is None, `allow_none` will default to True; otherwise, False.
+            allow_none=allow_none,
+            load_default=marshmallow.utils.missing if load_default is None else load_default,
+            **kwargs,
+        )
 
     def _serialize(self, value, attr, obj, **kwargs):
         if value is not None:
@@ -76,7 +88,7 @@ class EnumField(mfields.Field):
             # value is None and None is allowed.
             return None
 
-        raise ValidationError(
+        raise marshmallow.exceptions.ValidationError(
             message=f"Field of type {type(self).__name__} is None, but allow_none=False"
         )
 
@@ -173,6 +185,68 @@ class BytesAsHex(mfields.Field):
             raise self.make_error("invalid", input=value)
 
         return bytes.fromhex(value)
+
+
+class BytesAsIntTuple(mfields.Field):
+    """
+    A field that behaves like bytes, but serializes to a tuple of ints.
+    """
+
+    default_error_messages = {"invalid": 'Expected a tuple of ints, got: "{input}".'}
+
+    def _serialize(self, value, attr, obj, **kwargs) -> Optional[Tuple[int, ...]]:
+        if value is None:
+            return None
+        assert isinstance(value, bytes)
+        return tuple(value)
+
+    def _deserialize(self, value, attr, data, **kwargs) -> bytes:
+        if not isinstance(value, tuple):
+            raise self.make_error("invalid", input=value)
+
+        return bytes(value)
+
+
+class IntAsBytesIntTuple(mfields.Field):
+    """
+    A field that behaves like an int, but serializes using BytesAsIntTuple over the byte
+    representation of self.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.bytes_as_int_tuple = BytesAsIntTuple(**kwargs)
+
+    def _serialize(self, value, attr, obj, **kwargs) -> Optional[Tuple[int, ...]]:
+        return self.bytes_as_int_tuple._serialize(
+            to_bytes(value, byte_order="big"), attr, obj, **kwargs
+        )
+
+    def _deserialize(self, value, attr, data, **kwargs) -> int:
+        return int.from_bytes(
+            self.bytes_as_int_tuple._deserialize(value, attr, data, **kwargs), byteorder="big"
+        )
+
+
+class DictAsList(mfields.Dict):
+    """
+    A field that behaves like a dict, but serializes to a list of 2 element tuples.
+    """
+
+    default_error_messages = {"invalid": 'Expected a list of length 2 tuples, got: "{input}".'}
+
+    def _serialize(self, value, attr, obj, **kwargs):
+        serialized = super()._serialize(value, attr, obj, **kwargs)
+        if serialized is None:
+            return None
+
+        return [(k, v) for k, v in serialized.items()]
+
+    def _deserialize(self, value, attr, data, **kwargs):
+        if not isinstance(value, list) or any(len(elem) != 2 for elem in value):
+            raise self.make_error("invalid", input=value)
+
+        return super()._deserialize({elem[0]: elem[1] for elem in value}, attr, data, **kwargs)
 
 
 class BytesAsBase64Str(mfields.Field):
@@ -278,10 +352,16 @@ def additional_metadata(**kwargs) -> FieldMetadata:
 
 
 def enum_field_metadata(
-    *, enum_class: type, require: bool = True, allow_none: bool = False
+    *,
+    enum_class: type,
+    required: Optional[bool] = None,
+    allow_none: Optional[bool] = None,
+    load_default: Optional[Enum] = None,
 ) -> FieldMetadata:
     return additional_metadata(
-        marshmallow_field=EnumField(enum_cls=enum_class, required=require, allow_none=allow_none)
+        marshmallow_field=EnumField(
+            enum_cls=enum_class, required=required, allow_none=allow_none, load_default=load_default
+        ),
     )
 
 
@@ -292,3 +372,13 @@ nonrequired_optional_metadata: FieldMetadata = additional_metadata(
     load_default=None, required=False
 )
 nonrequired_list_metadata: FieldMetadata = additional_metadata(load_default=list, required=False)
+
+bytes_as_hex_metadata = additional_metadata(marshmallow_field=BytesAsHex(required=True))
+
+bytes_as_hex_list_metadata = additional_metadata(
+    marshmallow_field=mfields.List(BytesAsHex(required=True))
+)
+
+optional_bytes_as_hex_list_metadata = additional_metadata(
+    marshmallow_field=mfields.List(BytesAsHex, required=False, allow_none=True, load_default=None),
+)

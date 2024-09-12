@@ -23,14 +23,17 @@ struct GlobalValues {
     initial_ap: felt,
     final_ap: felt,
     initial_pedersen_addr: felt,
-    initial_rc_addr: felt,
+    initial_range_check_addr: felt,
     initial_ecdsa_addr: felt,
     initial_bitwise_addr: felt,
     initial_ec_op_addr: felt,
     initial_keccak_addr: felt,
     initial_poseidon_addr: felt,
-    rc_min: felt,
-    rc_max: felt,
+    initial_range_check96_addr: felt,
+    add_mod__initial_mod_addr: felt,
+    mul_mod__initial_mod_addr: felt,
+    range_check_min: felt,
+    range_check_max: felt,
 
     // Constants.
     offset_size: felt,
@@ -60,14 +63,16 @@ struct GlobalValues {
     // Interaction elements.
     memory__multi_column_perm__perm__interaction_elm: felt,
     memory__multi_column_perm__hash_interaction_elm0: felt,
-    rc16__perm__interaction_elm: felt,
+    range_check16__perm__interaction_elm: felt,
     diluted_check__permutation__interaction_elm: felt,
     diluted_check__interaction_z: felt,
     diluted_check__interaction_alpha: felt,
+    add_mod__interaction_elm: felt,
+    mul_mod__interaction_elm: felt,
 
     // Permutation products.
     memory__multi_column_perm__perm__public_memory_prod: felt,
-    rc16__perm__public_memory_prod: felt,
+    range_check16__perm__public_memory_prod: felt,
     diluted_check__first_elm: felt,
     diluted_check__permutation__public_memory_prod: felt,
     diluted_check__final_cum_val: felt,
@@ -78,8 +83,10 @@ struct GlobalValues {
 struct InteractionElements {
     memory__multi_column_perm__perm__interaction_elm: felt,
     memory__multi_column_perm__hash_interaction_elm0: felt,
-    rc16__perm__interaction_elm: felt,
+    range_check16__perm__interaction_elm: felt,
     diluted_check__permutation__interaction_elm: felt,
     diluted_check__interaction_z: felt,
     diluted_check__interaction_alpha: felt,
+    add_mod__interaction_elm: felt,
+    mul_mod__interaction_elm: felt,
 }

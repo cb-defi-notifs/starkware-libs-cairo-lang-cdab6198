@@ -9,11 +9,28 @@ import marshmallow.fields as mfields
 import marshmallow_dataclass
 import typeguard
 
+from starkware.starkware_utils.error_handling import StarkErrorCode, stark_assert
 from starkware.starkware_utils.serializable_dataclass import SerializableMarshmallowDataclass
-from starkware.starkware_utils.validated_fields import ValidatedField
+from starkware.starkware_utils.validated_fields import Field, ValidatedField
 
 TValidatedDataclass = TypeVar("TValidatedDataclass", bound="ValidatedDataclass")
 T = TypeVar("T")
+
+
+def rename_old_field_in_pre_load(
+    data: Dict[str, Any], old_field_name: str, new_field_name: str
+) -> Dict[str, Any]:
+    if old_field_name in data:
+        stark_assert(
+            new_field_name not in data,
+            code=StarkErrorCode.MALFORMED_REQUEST,
+            message=(
+                f"Error while renaming {old_field_name} to {new_field_name}. "
+                "It is unexpected to have both fields in the data."
+            ),
+        )
+        data[new_field_name] = data.pop(old_field_name)
+    return data
 
 
 def get_from_nested_metadata(metadata: Mapping[str, Any], key: str) -> Any:
@@ -112,23 +129,16 @@ class ValidatedDataclass:
             if non_init_with_default(field=field):
                 continue
 
-            metadata = getattr(field, "metadata", None)
-            if metadata is None:
+            if getattr(field, "metadata", None) is None:
                 continue
 
             value = getattr(self, field.name)
             # First use the field_validated argument, and only if it does not exist,
             # use the validation inside the marshmallow field argument.
-            validated_field = get_from_nested_metadata(metadata=metadata, key="validated_field")
-            if validated_field is None:
-                marshmallow_field = field.metadata.get("marshmallow_field", None)
-                if marshmallow_field is not None:
-                    validate_field(field=marshmallow_field, value=value)
-            else:
-                name_in_messages = get_from_nested_metadata(
-                    metadata=metadata, key="name_in_messages"
-                )
-                validated_field.validate(value=value, name=name_in_messages)
+            if isinstance(validated_field := get_validated_field(field=field), ValidatedField):
+                validated_field.validate(value=value)
+            elif (marshmallow_field := field.metadata.get("marshmallow_field")) is not None:
+                validate_field(field=marshmallow_field, value=value)
 
     def validate_types(self):
         for field in dataclasses.fields(self):
@@ -160,7 +170,7 @@ class HashableMarshmallowDataclass(ValidatedMarshmallowDataclass):
         return hashlib.sha256(self.serialize()).digest()
 
 
-def get_validated_field(field: dataclasses.Field) -> Optional[ValidatedField]:
+def get_validated_field(field: dataclasses.Field) -> Optional[Field]:
     """
     Checks if the dataclass field has a validated_field attribute in its metadata.
     If so returns it, otherwise returns None.

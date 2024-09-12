@@ -2,16 +2,16 @@ import asyncio
 import functools
 import logging
 from abc import ABC, abstractmethod
-from typing import Iterable, Optional, Set, Tuple, cast
+from typing import Iterable, Optional, Tuple
 
 from services.everest.business_logic.internal_transaction import EverestInternalStateTransaction
+from services.everest.business_logic.state import StateSelectorBase
 from services.everest.business_logic.state_api import StateProxy
 from starkware.starknet.business_logic.execution.objects import (
     CallInfo,
     ResourcesMapping,
     TransactionExecutionInfo,
 )
-from starkware.starknet.business_logic.fact_state.contract_state_objects import StateSelector
 from starkware.starknet.business_logic.state.state import StateSyncifier, UpdatesTrackerState
 from starkware.starknet.business_logic.state.state_api import State, SyncState
 from starkware.starknet.definitions.constants import GasCost
@@ -35,28 +35,12 @@ class InternalStateTransaction(EverestInternalStateTransaction, ABC):
 
     @staticmethod
     def get_state_selector_of_many(
-        txs: Iterable["EverestInternalStateTransaction"], general_config: Config
-    ) -> StateSelector:
-        """
-        Returns the state selector of a collection of transactions (i.e., union of selectors).
-        """
-        # Downcast arguments to application-specific types.
-        assert isinstance(general_config, StarknetGeneralConfig)
+        txs: Iterable[EverestInternalStateTransaction], general_config: Config
+    ) -> StateSelectorBase:
+        raise NotImplementedError
 
-        contract_addresses: Set[int] = set()
-        class_hashes: Set[int] = set()
-
-        for tx in txs:
-            state_selector = tx.get_state_selector(general_config=general_config)
-            state_selector = cast(StateSelector, state_selector)
-            contract_addresses.update(state_selector.contract_addresses)
-            class_hashes.update(state_selector.class_hashes)
-
-        frozen_contract_addresses = frozenset(contract_addresses)
-        frozen_class_hashes = frozenset(class_hashes)
-        return StateSelector(
-            contract_addresses=frozen_contract_addresses, class_hashes=frozen_class_hashes
-        )
+    def get_state_selector(self, general_config: Config) -> StateSelectorBase:
+        raise NotImplementedError
 
     async def apply_state_updates(
         self, state: StateProxy, general_config: Config

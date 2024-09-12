@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0.
-pragma solidity ^0.6.12;
+pragma solidity >=0.6.12;
 
 import "./IStarknetMessagingEvents.sol";
 
@@ -8,6 +8,12 @@ interface IStarknetMessaging is IStarknetMessagingEvents {
       Returns the max fee (in Wei) that StarkNet will accept per single message.
     */
     function getMaxL1MsgFee() external pure returns (uint256);
+
+    /**
+      Returns `msg_fee + 1` if there is a pending message associated with the given 'msgHash',
+      otherwise, returns 0.
+    */
+    function l1ToL2Messages(bytes32 msgHash) external view returns (uint256);
 
     /**
       Sends a message to an L2 contract.

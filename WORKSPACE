@@ -1,5 +1,6 @@
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file")
 load("//bazel_utils:get_from_cairo_lang.bzl", "get_from_cairo_lang")
+load("//src/starkware/cairo:vars_cairo_compiler.bzl", "CAIRO_COMPILER_ARCHIVE")
 
 http_archive(
     name = "build_bazel_rules_nodejs",
@@ -32,20 +33,34 @@ http_file(
     ],
 )
 
-http_archive(
-    name = "rules_python",
-    sha256 = "a3a6e99f497be089f81ec082882e40246bfd435f52f4e82f37e89449b04573f6",
-    strip_prefix = "rules_python-0.10.2",
-    url = "https://github.com/bazelbuild/rules_python/archive/refs/tags/0.10.2.tar.gz",
+http_file(
+    name = "solc-0.8.24",
+    downloaded_file_path = "solc-0.8.24",
+    executable = True,
+    sha256 = "fb03a29a517452b9f12bcf459ef37d0a543765bb3bbc911e70a87d6a37c30d5f",
+    urls = ["https://binaries.soliditylang.org/linux-amd64/solc-linux-amd64-v0.8.24+commit.e11b9ed9"],
 )
 
 http_archive(
-    name = "cairo-compiler-archive-2.0.0",
+    name = "rules_python",
+    patch_args = ["-p1"],
+    patches = ["//bazel_utils/patches:rules_python.patch"],
+    sha256 = "9d04041ac92a0985e344235f5d946f71ac543f1b1565f2cdbc9a2aaee8adf55b",
+    strip_prefix = "rules_python-0.26.0",
+    url = "https://github.com/bazelbuild/rules_python/releases/download/0.26.0/rules_python-0.26.0.tar.gz",
+)
+
+load("@rules_python//python:repositories.bzl", "py_repositories", "python_register_toolchains")
+
+py_repositories()
+
+http_archive(
+    name = CAIRO_COMPILER_ARCHIVE,
     build_file = get_from_cairo_lang(
-        "//src/starkware/starknet/compiler/v1:BUILD.cairo-compiler-archive",
+        "//src/starkware/starknet/compiler/v1:BUILD." + CAIRO_COMPILER_ARCHIVE,
     ),
     strip_prefix = "cairo",
-    url = "https://github.com/starkware-libs/cairo/releases/download/v2.0.0-rc5/release-x86_64-unknown-linux-musl.tar.gz",
+    url = "https://github.com/starkware-libs/cairo/releases/download/v2.7.0/release-x86_64-unknown-linux-musl.tar.gz",
 )
 
 http_archive(
@@ -57,8 +72,6 @@ http_archive(
 )
 
 register_toolchains("//bazel_utils/python:py_stub_toolchain")
-
-load("@rules_python//python:repositories.bzl", "python_register_toolchains")
 
 python_register_toolchains(
     name = "python3",
@@ -72,6 +85,10 @@ load("@rules_python//python:pip.bzl", "pip_parse")
 
 pip_parse(
     name = "cpython_reqs",
+    extra_pip_args = [
+        "--retries=100",
+        "--timeout=3000",
+    ],
     python_interpreter_target = interpreter,
     requirements_lock = "//scripts:requirements.txt",
 )
@@ -82,6 +99,10 @@ install_deps()
 
 pip_parse(
     name = "pypy_reqs",
+    extra_pip_args = [
+        "--retries=100",
+        "--timeout=3000",
+    ],
     python_interpreter_target = "@pypy3.9//:bin/pypy3",
     requirements_lock = "//scripts:pypy-requirements.txt",
 )

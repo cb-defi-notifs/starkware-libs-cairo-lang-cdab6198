@@ -2,17 +2,17 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
-from typing import Dict, Iterable, List, Optional, Tuple, cast
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from starkware.cairo.common.cairo_function_runner import CairoFunctionRunner
 from starkware.cairo.lang.builtins.all_builtins import with_suffix
 from starkware.cairo.lang.vm.cairo_pie import ExecutionResources
 from starkware.python.utils import from_bytes, sub_counters, to_bytes
+from starkware.starknet.business_logic.execution.deprecated_objects import ExecutionResourcesManager
 from starkware.starknet.business_logic.execution.gas_usage import calculate_tx_gas_usage
 from starkware.starknet.business_logic.execution.objects import (
     CallInfo,
     CallResult,
-    ExecutionResourcesManager,
     ResourcesMapping,
     TransactionExecutionInfo,
 )
@@ -33,6 +33,7 @@ from starkware.starknet.services.api.contract_class.contract_class import (
     ContractClass,
     DeprecatedCompiledClass,
 )
+from starkware.starknet.services.api.gateway.deprecated_transaction import DeprecatedInvokeFunction
 from starkware.starkware_utils.error_handling import (
     StarkException,
     stark_assert,
@@ -41,10 +42,6 @@ from starkware.starkware_utils.error_handling import (
 from starkware.storage.storage import Fact, FactFetchingContext
 
 logger = logging.getLogger(__name__)
-
-FEE_TRANSFER_N_STORAGE_CHANGES = 2  # Sender and sequencer balance update.
-# Exclude the sequencer balance update, since it's charged once throughout the batch.
-FEE_TRANSFER_N_STORAGE_CHANGES_TO_CHARGE = FEE_TRANSFER_N_STORAGE_CHANGES - 1
 
 VALIDATE_BLACKLISTED_SYSCALLS: Tuple[str, ...] = ("call_contract",)
 
@@ -125,47 +122,12 @@ def verify_version(
     )
 
 
-def preprocess_invoke_function_fields(
-    entry_point_selector: int,
-    nonce: Optional[int],
-    max_fee: int,
-    version: int,
-) -> Tuple[int, List[int]]:
-    """
-    Performs validation on fields related to function invocation transaction.
-    Deduces and returns fields required for hash calculation of
-    InvokeFunction transaction.
-    """
-    # Validate entry point type-related fields.
-    additional_data: List[int]
-    validate_selector_for_fee(selector=entry_point_selector, max_fee=max_fee)
-
-    if version in [0, constants.QUERY_VERSION_BASE]:
-        stark_assert(
-            nonce is None,
-            code=StarknetErrorCode.INVALID_TRANSACTION_NONCE,
-            message="An InvokeFunction transaction (version = 0) cannot have a nonce.",
-        )
-        additional_data = []
-        entry_point_selector_field = entry_point_selector
-    else:
-        stark_assert(
-            nonce is not None,
-            code=StarknetErrorCode.INVALID_TRANSACTION_NONCE,
-            message="An InvokeFunction transaction (version != 0) must have a nonce.",
-        )
-        additional_data = [cast(int, nonce)]
-        entry_point_selector_field = 0
-
-    return entry_point_selector_field, additional_data
-
-
-def validate_selector_for_fee(selector: int, max_fee: int):
-    if max_fee == 0:
+def validate_selector_for_fee(tx: DeprecatedInvokeFunction):
+    if tx.zero_max_fee or tx.entry_point_selector is None:
         return
 
     stark_assert(
-        selector == starknet_abi.EXECUTE_ENTRY_POINT_SELECTOR,
+        tx.entry_point_selector == starknet_abi.EXECUTE_ENTRY_POINT_SELECTOR,
         code=StarknetErrorCode.UNAUTHORIZED_ENTRY_POINT_FOR_INVOKE,
         message=(
             "All transactions should go through the "
@@ -198,6 +160,9 @@ def calculate_tx_resources(
     call_infos: Iterable[Optional[CallInfo]],
     tx_type: TransactionType,
     state: UpdatesTrackerState,
+    fee_token_address: int,
+    is_nonce_increment: bool,
+    sender_address: Optional[int],
     l1_handler_payload_size: Optional[int] = None,
 ) -> ResourcesMapping:
     """
@@ -209,9 +174,14 @@ def calculate_tx_resources(
     (
         n_modified_contracts,
         n_storage_changes,
-        n_class_updates,
+        n_class_hash_updates,
+        n_compiled_class_hash_updates,
         _n_nonce_updates,
-    ) = state.count_actual_updates()
+    ) = state.count_actual_updates_for_fee_charge(
+        fee_token_address=fee_token_address,
+        is_nonce_increment=is_nonce_increment,
+        sender_address=sender_address,
+    )
 
     return calculate_tx_resources_given_usage(
         resources_manager=resources_manager,
@@ -219,7 +189,8 @@ def calculate_tx_resources(
         tx_type=tx_type,
         n_modified_contracts=n_modified_contracts,
         n_storage_changes=n_storage_changes,
-        n_class_updates=n_class_updates,
+        n_class_hash_updates=n_class_hash_updates,
+        n_compiled_class_hash_updates=n_compiled_class_hash_updates,
         l1_handler_payload_size=l1_handler_payload_size,
     )
 
@@ -230,7 +201,8 @@ def calculate_tx_resources_given_usage(
     tx_type: TransactionType,
     n_modified_contracts: int,
     n_storage_changes: int,
-    n_class_updates: int,
+    n_class_hash_updates: int,
+    n_compiled_class_hash_updates: int,
     l1_handler_payload_size: Optional[int] = None,
 ) -> ResourcesMapping:
     non_optional_call_infos = [call for call in call_infos if call is not None]
@@ -241,9 +213,10 @@ def calculate_tx_resources_given_usage(
     l1_gas_usage = calculate_tx_gas_usage(
         l2_to_l1_messages=l2_to_l1_messages,
         n_modified_contracts=n_modified_contracts,
-        n_storage_changes=n_storage_changes + FEE_TRANSFER_N_STORAGE_CHANGES_TO_CHARGE,
+        n_storage_changes=n_storage_changes,
         l1_handler_payload_size=l1_handler_payload_size,
-        n_class_updates=n_class_updates,
+        n_class_hash_updates=n_class_hash_updates,
+        n_compiled_class_hash_updates=n_compiled_class_hash_updates,
     )
 
     cairo_usage_with_segment_arena_builtin = resources_manager.cairo_usage
@@ -349,13 +322,3 @@ def validate_entrypoint_execution_context(resources_manager: ExecutionResourcesM
             f"{[name for name, count in diff.items() if count > 0]}."
         ),
     )
-
-
-def verify_no_calls_to_other_contracts(call_info: CallInfo, function_name: str):
-    invoked_contract_address = call_info.contract_address
-    for internal_call in call_info.gen_call_topology():
-        if internal_call.contract_address != invoked_contract_address:
-            raise StarkException(
-                code=StarknetErrorCode.UNAUTHORIZED_ACTION_ON_VALIDATE,
-                message=f"Calling other contracts during {function_name} execution is forbidden.",
-            )

@@ -16,6 +16,7 @@ from starkware.python.utils import as_non_optional
 from starkware.starknet.builtins.segment_arena.segment_arena_builtin_runner import (
     SegmentArenaBuiltinRunner,
 )
+from starkware.starknet.business_logic.execution.deprecated_objects import ExecutionResourcesManager
 from starkware.starknet.business_logic.execution.execute_entry_point_base import (
     ExecuteEntryPointBase,
 )
@@ -23,7 +24,6 @@ from starkware.starknet.business_logic.execution.objects import (
     CallInfo,
     CallResult,
     CallType,
-    ExecutionResourcesManager,
     OrderedEvent,
     OrderedL2ToL1Message,
     TransactionExecutionContext,
@@ -42,6 +42,7 @@ from starkware.starknet.core.os.syscall_handler import BusinessLogicSyscallHandl
 from starkware.starknet.definitions import fields
 from starkware.starknet.definitions.constants import GasCost
 from starkware.starknet.definitions.error_codes import StarknetErrorCode
+from starkware.starknet.definitions.execution_mode import ExecutionMode
 from starkware.starknet.definitions.general_config import (
     STARKNET_LAYOUT_INSTANCE,
     StarknetGeneralConfig,
@@ -84,9 +85,9 @@ class ExecuteEntryPoint(ExecuteEntryPointBase):
         entry_point_type: EntryPointType,
         call_type: Optional[CallType] = None,
         class_hash: Optional[int] = None,
-    ):
+    ) -> "ExecuteEntryPoint":
         return cls(
-            call_type=CallType.CALL if call_type is None else call_type,
+            call_type=CallType.Call if call_type is None else call_type,
             contract_address=contract_address,
             calldata=calldata,
             code_address=None,
@@ -108,7 +109,7 @@ class ExecuteEntryPoint(ExecuteEntryPointBase):
         initial_gas: int = GasCost.INITIAL.value,
         call_type: Optional[CallType] = None,
         class_hash: Optional[int] = None,
-    ):
+    ) -> "ExecuteEntryPoint":
         return cls.create(
             call_type=call_type,
             contract_address=contract_address,
@@ -144,10 +145,11 @@ class ExecuteEntryPoint(ExecuteEntryPointBase):
         general_config: StarknetGeneralConfig,
         resources_manager: Optional[ExecutionResourcesManager] = None,
         tx_execution_context: Optional[TransactionExecutionContext] = None,
+        execution_mode: ExecutionMode = ExecutionMode.EXECUTE,
     ) -> CallInfo:
         if tx_execution_context is None:
             tx_execution_context = TransactionExecutionContext.create_for_testing(
-                n_steps=general_config.invoke_tx_max_n_steps
+                n_steps=general_config.invoke_tx_max_n_steps, execution_mode=execution_mode
             )
 
         if resources_manager is None:
@@ -429,7 +431,7 @@ class ExecuteEntryPoint(ExecuteEntryPointBase):
 
         selector_formatter = fields.EntryPointSelectorField.format
         hash_formatter = fields.ClassHashIntField.format
-        # Non-unique entry points are not possible in a DeprecatedCompiledClass object, thus
+        # Non-unique entry points are not possible in a `DeprecatedCompiledClass` object, thus
         # len(filtered_entry_points) <= 1.
         stark_assert(
             len(filtered_entry_points) == 1,
@@ -453,7 +455,7 @@ class ExecuteEntryPoint(ExecuteEntryPointBase):
         result: CallResult,
         class_hash: int,
     ) -> CallInfo:
-        return CallInfo(
+        return CallInfo.create(
             # Execution params.
             caller_address=self.caller_address,
             call_type=self.call_type,
@@ -485,12 +487,12 @@ class ExecuteEntryPoint(ExecuteEntryPointBase):
         """
         if self.class_hash is not None:
             # Library call.
-            assert self.call_type is CallType.DELEGATE
+            assert self.call_type is CallType.Delegate
             return self.class_hash
 
-        if self.call_type is CallType.CALL:
+        if self.call_type is CallType.Call:
             code_address = self.contract_address
-        elif self.call_type is CallType.DELEGATE:
+        elif self.call_type is CallType.Delegate:
             # Delegate call (deprecated version).
             assert self.code_address is not None
             code_address = self.code_address
@@ -614,7 +616,7 @@ def clean_leaks(
         del runner.vm.validated_memory
         del runner.vm.accessed_addresses
         del runner.vm.hint_pc_and_index
-        del runner.vm.trace
+        del runner.vm._trace
         del runner.vm.builtin_runners
         del runner.vm.run_context.memory
         del runner.vm.run_context

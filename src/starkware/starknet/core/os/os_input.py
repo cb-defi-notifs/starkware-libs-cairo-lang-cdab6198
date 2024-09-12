@@ -1,10 +1,14 @@
 import dataclasses
 from dataclasses import field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
+import marshmallow.fields as mfields
 import marshmallow_dataclass
 
 from starkware.starknet.business_logic.fact_state.contract_state_objects import ContractState
+from starkware.starknet.business_logic.transaction.internal_transaction_schema import (
+    InternalTransactionSchema,
+)
 from starkware.starknet.business_logic.transaction.objects import InternalTransaction
 from starkware.starknet.core.os.deprecated_syscall_handler import DeprecatedOsSysCallHandler
 from starkware.starknet.core.os.syscall_handler import OsExecutionHelper, OsSyscallHandler
@@ -33,11 +37,18 @@ class StarknetOsInput(ValidatedMarshmallowDataclass):
     compiled_classes: Dict[int, CompiledClass] = field(
         metadata=fields.new_class_hash_dict_keys_metadata(values_schema=CompiledClass.Schema)
     )
+    compiled_class_visited_pcs: Dict[int, List[int]]
     contracts: Dict[int, ContractState]
     class_hash_to_compiled_class_hash: Dict[int, int]
     general_config: StarknetGeneralConfig
-    transactions: List[InternalTransaction]
-    block_hash: int
+    transactions: Sequence[InternalTransaction] = field(
+        metadata=dict(marshmallow_field=mfields.List(mfields.Nested(InternalTransactionSchema)))
+    )
+    # A mapping from Cairo 1 declared class hashes to the hashes of the contract class components.
+    declared_class_hash_to_component_hashes: Dict[int, List[int]]
+    prev_block_hash: int
+    new_block_hash: int
+    full_output: int
 
 
 @dataclasses.dataclass(frozen=True)

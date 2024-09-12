@@ -4,7 +4,7 @@ from starkware.cairo.common.alloc import alloc
 from starkware.cairo.common.cairo_builtins import KeccakBuiltin
 from starkware.cairo.common.dict import dict_read
 from starkware.cairo.common.dict_access import DictAccess
-from starkware.cairo.common.find_element import find_element, search_sorted
+from starkware.cairo.common.find_element import find_element, search_sorted_optimistic
 from starkware.cairo.common.math import assert_not_zero
 from starkware.cairo.common.registers import get_ap
 from starkware.starknet.builtins.segment_arena.segment_arena import (
@@ -111,7 +111,7 @@ func get_entry_point{range_check_ptr}(
 
     // The key must be at offset 0.
     static_assert CompiledClassEntryPoint.selector == 0;
-    let (entry_point_desc: CompiledClassEntryPoint*, success) = search_sorted(
+    let (entry_point_desc: CompiledClassEntryPoint*, success) = search_sorted_optimistic(
         array_ptr=cast(entry_points, felt*),
         elm_size=CompiledClassEntryPoint.SIZE,
         n_elms=n_entry_points,
@@ -214,7 +214,7 @@ func execute_entry_point{
 
     %{
         execution_helper.enter_call(
-            execution_info_ptr=ids.execution_context.execution_info.address_)
+            cairo_execution_info=ids.execution_context.execution_info)
     %}
     %{ vm_enter_scope({'syscall_handler': syscall_handler}) %}
     call abs contract_entry_point;
@@ -229,14 +229,36 @@ func execute_entry_point{
     local entry_point_return_values: EntryPointReturnValues* = cast(
         return_values_ptr, EntryPointReturnValues*
     );
+
+    // Check that the execution was successful.
     %{
+        return_values = ids.entry_point_return_values
+        if return_values.failure_flag != 0:
+            # Fetch the error, up to 100 elements.
+            retdata_size = return_values.retdata_end - return_values.retdata_start
+            error = memory.get_range(return_values.retdata_start, max(0, min(100, retdata_size)))
+
+            print("Invalid return value in execute_entry_point:")
+            print(f"  Class hash: {hex(ids.execution_context.class_hash)}")
+            print(f"  Selector: {hex(ids.execution_context.execution_info.selector)}")
+            print(f"  Size: {retdata_size}")
+            print(f"  Error (at most 100 elements): {error}")
+
+        if execution_helper.debug_mode:
+            # Validate the predicted gas cost.
+            actual = ids.remaining_gas - ids.entry_point_return_values.gas_builtin
+            predicted = execution_helper.call_info.gas_consumed
+            assert actual == predicted, (
+                "Predicted gas costs are inconsistent with the actual execution; "
+                f"{predicted=}, {actual=}."
+            )
+
+        # Exit call.
         syscall_handler.validate_and_discard_syscall_ptr(
             syscall_ptr_end=ids.entry_point_return_values.syscall_ptr
         )
         execution_helper.exit_call()
     %}
-
-    // Check that the execution was successful.
     assert entry_point_return_values.failure_flag = 0;
 
     let remaining_gas = entry_point_return_values.gas_builtin;
@@ -297,6 +319,9 @@ func prepare_builtin_ptrs_for_execute(builtin_ptrs: BuiltinPointers*) -> Builtin
             ec_op=selectable_builtins.ec_op,
             poseidon=selectable_builtins.poseidon,
             segment_arena=segment_arena_ptr,
+            range_check96=selectable_builtins.range_check96,
+            add_mod=selectable_builtins.add_mod,
+            mul_mod=selectable_builtins.mul_mod,
         ),
         non_selectable=builtin_ptrs.non_selectable,
     );

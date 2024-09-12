@@ -1,18 +1,15 @@
-from starkware.cairo.common.cairo_secp.bigint import BigInt3, UnreducedBigInt3, nondet_bigint3
+from starkware.cairo.common.alloc import alloc
+from starkware.cairo.common.cairo_secp.bigint import nondet_bigint3
+from starkware.cairo.common.cairo_secp.bigint3 import BigInt3, SumBigInt3, UnreducedBigInt3
+from starkware.cairo.common.cairo_secp.ec_point import EcPoint
 from starkware.cairo.common.cairo_secp.field import (
     is_zero,
     unreduced_mul,
     unreduced_sqr,
     verify_zero,
 )
-
-// Represents a point on the secp256k1 elliptic curve.
-// The zero point is represented as a point with x = 0 (there is no point on the curve with a zero
-// x value).
-struct EcPoint {
-    x: BigInt3,
-    y: BigInt3,
-}
+from starkware.cairo.common.math import assert_nn_le
+from starkware.cairo.common.uint256 import Uint256
 
 // Computes the negation of a point on the elliptic curve, which is a point with the same x value
 // and the negation of the y value. If the point is the zero point, returns the zero point.
@@ -251,7 +248,7 @@ func fast_ec_add{range_check_ptr}(point0: EcPoint, point1: EcPoint) -> (res: EcP
 
 // Same as fast_ec_add, except that the cases point0 = +/-point1 are supported.
 func ec_add{range_check_ptr}(point0: EcPoint, point1: EcPoint) -> (res: EcPoint) {
-    let x_diff = BigInt3(
+    let x_diff = SumBigInt3(
         d0=point0.x.d0 - point1.x.d0, d1=point0.x.d1 - point1.x.d1, d2=point0.x.d2 - point1.x.d2
     );
     let (same_x: felt) = is_zero(x_diff);
@@ -262,7 +259,7 @@ func ec_add{range_check_ptr}(point0: EcPoint, point1: EcPoint) -> (res: EcPoint)
 
     // We have point0.x = point1.x. This implies point0.y = +/-point1.y.
     // Check whether point0.y = -point1.y.
-    let y_sum = BigInt3(
+    let y_sum = SumBigInt3(
         d0=point0.y.d0 + point1.y.d0, d1=point0.y.d1 + point1.y.d1, d2=point0.y.d2 + point1.y.d2
     );
     let (opposite_y: felt) = is_zero(y_sum);
@@ -277,14 +274,14 @@ func ec_add{range_check_ptr}(point0: EcPoint, point1: EcPoint) -> (res: EcPoint)
     }
 }
 
-// Given a scalar, an integer m in the range [0, 250), and a point on the elliptic curve, point,
+// Given (1) an integer m in the range [0, 250), (2) a scalar, and (3) a point on the curve,
 // verifies that 0 <= scalar < 2**m and returns (2**m * point, scalar * point).
 func ec_mul_inner{range_check_ptr}(point: EcPoint, scalar: felt, m: felt) -> (
     pow2: EcPoint, res: EcPoint
 ) {
     if (m == 0) {
         with_attr error_message("Too large scalar") {
-            scalar = 0;
+            assert scalar = 0;
         }
         let ZERO_POINT = EcPoint(BigInt3(0, 0, 0), BigInt3(0, 0, 0));
         return (pow2=point, res=ZERO_POINT);
@@ -318,4 +315,109 @@ func ec_mul{range_check_ptr}(point: EcPoint, scalar: BigInt3) -> (res: EcPoint) 
     let (res: EcPoint) = ec_add(res0, res1);
     let (res: EcPoint) = ec_add(res, res2);
     return (res=res);
+}
+
+// Given a point and a 256-bit scalar, returns scalar * point.
+func ec_mul_by_uint256{range_check_ptr}(point: EcPoint, scalar: Uint256) -> (res: EcPoint) {
+    alloc_locals;
+    let (local table: EcPoint*) = alloc();
+    build_ec_mul_table(point, table);
+
+    local first_nibble;
+    local last_nibble;
+    %{
+        num = (ids.scalar.high << 128) + ids.scalar.low
+        nibbles = [(num >> i) & 0xf for i in range(0, 256, 4)]
+        ids.first_nibble = nibbles.pop()
+        ids.last_nibble = nibbles[0]
+    %}
+    assert_nn_le(first_nibble, 15);
+    let (res, scalar_high) = fast_ec_mul_inner(table, table[first_nibble], first_nibble, 124);
+    assert scalar_high = scalar.high;
+
+    // The last addition must be done with `ec_add` rather then `fast_ec_add` so we do it
+    // separately from the rest of the additions in `fast_ec_mul_inner`.
+    let (res, scalar_low) = fast_ec_mul_inner(table, res, 0, 124);
+    assert scalar.low = 16 * scalar_low + last_nibble;
+    assert_nn_le(last_nibble, 15);
+    let (res) = ec_double(res);
+    let (res) = ec_double(res);
+    let (res) = ec_double(res);
+    let (res) = ec_double(res);
+    return ec_add(res, table[last_nibble]);
+}
+
+// Given a point on the curve computes a table of size 16 where table[i] = i * point.
+// The table is allocated in the caller to avoid local variables in this function.
+func build_ec_mul_table{range_check_ptr}(point: EcPoint, table: EcPoint*) {
+    assert table[0] = EcPoint(BigInt3(0, 0, 0), BigInt3(0, 0, 0));
+    assert table[1] = point;
+    let (t2) = ec_double(point);
+    assert table[2] = t2;
+    let (t3) = fast_ec_add(t2, point);
+    assert table[3] = t3;
+    let (t4) = fast_ec_add(t3, point);
+    assert table[4] = t4;
+    let (t5) = fast_ec_add(t4, point);
+    assert table[5] = t5;
+    let (t6) = fast_ec_add(t5, point);
+    assert table[6] = t6;
+    let (t7) = fast_ec_add(t6, point);
+    assert table[7] = t7;
+    let (t8) = fast_ec_add(t7, point);
+    assert table[8] = t8;
+    let (t9) = fast_ec_add(t8, point);
+    assert table[9] = t9;
+    let (t10) = fast_ec_add(t9, point);
+    assert table[10] = t10;
+    let (t11) = fast_ec_add(t10, point);
+    assert table[11] = t11;
+    let (t12) = fast_ec_add(t11, point);
+    assert table[12] = t12;
+    let (t13) = fast_ec_add(t12, point);
+    assert table[13] = t13;
+    let (t14) = fast_ec_add(t13, point);
+    assert table[14] = t14;
+    let (t15) = fast_ec_add(t14, point);
+    assert table[15] = t15;
+
+    return ();
+}
+
+// An inner helper function for ec_mul_by_uint256.
+// The function gets a table (see `build_ec_mul_table`) for some point `P`, a point `point` and two
+// scalars 'scalar' and 'm' and a hint variable nibbles (represented as a list of nibbles where the
+// last one is the most significant).
+// It verifies that 0 <= nibbles < 2**m.
+// It returns a point 'point_out' and a scalar 'scalar_out' such that:
+//   scalar_out = scalar * 2**m + nibbles,
+//   point_out = point * 2**m + P * nibbles.
+// The caller must add a constraint that `scalar_out` was constructed correctly.
+// Assumption: `point = i * P` for some `0 <= i < 2**248`.
+func fast_ec_mul_inner{range_check_ptr}(table: EcPoint*, point: EcPoint, scalar: felt, m: felt) -> (
+    point_out: EcPoint, scalar_out: felt
+) {
+    alloc_locals;
+    if (m == 0) {
+        return (point, scalar);
+    }
+
+    // Compute 16 * point.
+    let (point) = ec_double(point);
+    let (point) = ec_double(point);
+    let (point) = ec_double(point);
+    let (point) = ec_double(point);
+
+    local nibble = nondet %{ nibbles.pop() %};
+    assert_nn_le(nibble, 15);
+
+    // Note that we can use `fast_ec_add` instead of `ec_add`:
+    // Assume that `16 * point = +/- nibble * P` and `nibble * P != 0`.
+    // This implies `16 * i + nibble = 0 (mod N)` or `16 * i - nibble = 0 (mod N)`
+    // where `N` is the size of the elliptic curve.
+    // Since `i < 2**248`, `16 * i < 2**252` and so one of the equalities must be true as integers.
+    // But `16 * i + nibble > 0` and `16 * i != nibble` since `1 <= nibble <= 15`.
+    let (point) = fast_ec_add(point, table[nibble]);
+
+    return fast_ec_mul_inner(table=table, point=point, scalar=16 * scalar + nibble, m=m - 4);
 }

@@ -1,14 +1,16 @@
 import dataclasses
+import json
 import re
 from abc import abstractmethod
 from dataclasses import field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import marshmallow
 import marshmallow.fields as mfields
 import marshmallow_dataclass
 
+from services.everest.definitions import fields as everest_fields
 from starkware.cairo.lang.cairo_constants import DEFAULT_PRIME
 from starkware.cairo.lang.compiler.identifier_manager import IdentifierManager
 from starkware.cairo.lang.compiler.preprocessor.flow import ReferenceManager
@@ -26,8 +28,8 @@ from starkware.starkware_utils.validated_dataclass import (
     ValidatedMarshmallowDataclass,
 )
 
-# An ordered list of the supported builtins.
-SUPPORTED_BUILTINS = [
+# An ordered list of the supported builtins in Cairo 1.
+CAIRO1_SUPPORTED_BUILTINS = [
     "pedersen",
     "range_check",
     "ecdsa",
@@ -35,19 +37,33 @@ SUPPORTED_BUILTINS = [
     "ec_op",
     "poseidon",
     "segment_arena",
+    "range_check96",
+    "add_mod",
+    "mul_mod",
+]
+
+# An ordered list of the supported builtins in Cairo 0.
+CAIRO0_SUPPORTED_BUILTINS = [
+    "pedersen",
+    "range_check",
+    "ecdsa",
+    "bitwise",
+    "ec_op",
+    "poseidon",
 ]
 
 # Utilites.
 
 
-def validate_builtins(builtins: Optional[List[str]]):
+def validate_builtins(builtins: Optional[List[str]], is_cairo1: bool):
     if builtins is None:
         return
 
+    supported_builtins = CAIRO1_SUPPORTED_BUILTINS if is_cairo1 else CAIRO0_SUPPORTED_BUILTINS
     stark_assert(
-        is_subsequence(builtins, SUPPORTED_BUILTINS),
+        is_subsequence(builtins, supported_builtins),
         code=StarknetErrorCode.INVALID_CONTRACT_CLASS,
-        message=f"{builtins} is not a subsequence of {SUPPORTED_BUILTINS}.",
+        message=f"{builtins} is not a subsequence of {supported_builtins}.",
     )
 
 
@@ -74,9 +90,15 @@ class ContractClass(ValidatedMarshmallowDataclass):
     """
 
     contract_class_version: str
-    sierra_program: List[int] = field(metadata=fields.felt_as_hex_list_metadata)
+    sierra_program: List[int] = field(metadata=everest_fields.felt_as_hex_list_metadata)
     entry_points_by_type: Dict[EntryPointType, List[ContractEntryPoint]]
     abi: str
+
+    def get_bytecode_size(self) -> int:
+        return len(self.sierra_program)
+
+    def get_abi_size(self) -> int:
+        return len(self.abi)
 
 
 @marshmallow_dataclass.dataclass(frozen=True)
@@ -126,6 +148,13 @@ class CompiledClassBase(ValidatedMarshmallowDataclass):
         Returns the "bytecode" attribute of the compiled class.
         """
 
+    @property
+    @abstractmethod
+    def is_cairo1(self) -> bool:
+        """
+        Retruns whether the class was compiled from Cairo 1.
+        """
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -153,10 +182,10 @@ class CompiledClassBase(ValidatedMarshmallowDataclass):
         )
 
     def validate(self):
-        validate_builtins(builtins=self.get_builtins())
+        validate_builtins(builtins=self.get_builtins(), is_cairo1=self.is_cairo1)
         for entry_points in self.entry_points_by_type.values():
             for entry_point in entry_points:
-                validate_builtins(builtins=entry_point.builtins)
+                validate_builtins(builtins=entry_point.builtins, is_cairo1=self.is_cairo1)
 
         stark_assert(
             self.get_prime() == DEFAULT_PRIME,
@@ -175,15 +204,25 @@ class CompiledClassBase(ValidatedMarshmallowDataclass):
         return sum(len(eps) for eps in self.entry_points_by_type.values())
 
 
+# Represents a nested list of integers. E.g., [1, [2, [3], 4], 5, 6].
+NestedIntList = Union[int, List[Any]]
+
+
 @marshmallow_dataclass.dataclass(frozen=True)
 class CompiledClass(CompiledClassBase):
     """
-    Represents a compiled contract class in the StarkNet network.
+    Represents a compiled contract class in the Starknet network.
     """
 
     prime: int = field(metadata=additional_metadata(marshmallow_field=IntAsHex(required=True)))
     bytecode: List[int] = field(
         metadata=additional_metadata(marshmallow_field=mfields.List(IntAsHex(), required=True))
+    )
+    # Represents the structure of the bytecode segments, using a nested list of segment lengths.
+    # For example, [2, [3, 4]] represents a bytecode with 2 segments, the first is a leaf of length
+    # 2 and the second is a node with 2 children of lengths 3 and 4.
+    bytecode_segment_lengths: NestedIntList = field(
+        metadata=additional_metadata(marshmallow_field=fields.NestedIntListField())
     )
     # Rust hints.
     hints: List[Any]
@@ -191,6 +230,10 @@ class CompiledClass(CompiledClassBase):
     compiler_version: str = field(
         metadata=dict(marshmallow_field=mfields.String(required=False, load_default=None))
     )
+
+    @property
+    def is_cairo1(self) -> bool:
+        return True
 
     def get_builtins(self) -> List[str]:
         return []
@@ -200,6 +243,9 @@ class CompiledClass(CompiledClassBase):
 
     def get_bytecode(self) -> List[int]:
         return self.bytecode
+
+    def get_bytecode_size(self) -> int:
+        return len(self.get_bytecode())
 
     @marshmallow.decorators.pre_load
     def parse_pythonic_hints(self, data: Dict[str, Any], many: bool, **kwargs) -> Dict[str, Any]:
@@ -243,6 +289,16 @@ class CompiledClass(CompiledClassBase):
             for hint_id, hint_codes in pythonic_hints
         }
 
+        return data
+
+    @marshmallow.decorators.pre_load
+    def default_bytecode_segment_lengths(
+        self, data: Dict[str, Any], many: bool, **kwargs
+    ) -> Dict[str, Any]:
+        # If bytecode_segment_lengths is missing, use a single leaf (which forces loading the entire
+        # program).
+        if "bytecode_segment_lengths" not in data:
+            data["bytecode_segment_lengths"] = len(data["bytecode"])
         return data
 
     @marshmallow.decorators.post_dump
@@ -293,6 +349,10 @@ class DeprecatedCompiledClass(CompiledClassBase):
     program: Program
     abi: Optional[AbiType] = None
 
+    @property
+    def is_cairo1(self) -> bool:
+        return False
+
     def get_builtins(self) -> List[str]:
         return self.program.builtins
 
@@ -301,6 +361,12 @@ class DeprecatedCompiledClass(CompiledClassBase):
 
     def get_bytecode(self) -> List[int]:
         return self.program.data
+
+    def get_bytecode_size(self) -> int:
+        return len(self.get_bytecode())
+
+    def get_abi_size(self) -> int:
+        return len(json.dumps(self.abi)) if self.abi is not None else 0
 
     @marshmallow.decorators.post_dump
     def remove_none_builtins(self, data: Dict[str, Any], many: bool, **kwargs) -> Dict[str, Any]:
@@ -325,3 +391,13 @@ class DeprecatedCompiledClass(CompiledClassBase):
         """
         altered_program = dataclasses.replace(self.program, debug_info=None)
         return dataclasses.replace(self, program=altered_program)
+
+
+@dataclasses.dataclass(frozen=True)
+class RawCompiledClass:
+    """
+    Represents a raw compiled contract class in the Starknet network.
+    """
+
+    raw_compiled_class: str
+    version: int

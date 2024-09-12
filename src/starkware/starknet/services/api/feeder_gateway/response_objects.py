@@ -1,16 +1,14 @@
 import dataclasses
-from abc import abstractmethod
 from dataclasses import field
 from enum import Enum, auto
-from typing import Any, ClassVar, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, Union
 
 import marshmallow
 import marshmallow.exceptions
 import marshmallow.fields as mfields
 import marshmallow.utils
 import marshmallow_dataclass
-from marshmallow.decorators import post_dump, pre_load
-from marshmallow_oneofschema import OneOfSchema
+from marshmallow.decorators import pre_load
 from typing_extensions import Literal
 
 from services.everest.api.feeder_gateway.response_objects import (
@@ -20,28 +18,40 @@ from services.everest.api.feeder_gateway.response_objects import (
 from services.everest.business_logic.transaction_execution_objects import TransactionFailureReason
 from services.everest.definitions import fields as everest_fields
 from starkware.cairo.lang.vm.cairo_pie import ExecutionResources
+from starkware.crypto.signature.signature import ECSignature
 from starkware.eth.web3_wrapper import Web3
-from starkware.python.utils import as_non_optional, from_bytes, to_bytes
+from starkware.python.utils import as_non_optional, to_bytes
 from starkware.starknet.business_logic.execution.objects import (
     CallInfo,
     CallType,
     Event,
+    GasVector,
     OrderedEvent,
     OrderedL2ToL1Message,
 )
-from starkware.starknet.business_logic.transaction.objects import (
-    InternalDeclare,
-    InternalDeploy,
-    InternalDeployAccount,
-    InternalInvokeFunction,
-    InternalL1Handler,
-    InternalTransaction,
+from starkware.starknet.business_logic.state.state_api_objects import (
+    GasPrices,
+    ResourcePrice,
+    rename_old_gas_price_fields,
 )
-from starkware.starknet.definitions import constants, fields
-from starkware.starknet.definitions.transaction_type import TransactionType
+from starkware.starknet.business_logic.transaction.deprecated_objects import (
+    DeprecatedInternalTransaction,
+)
+from starkware.starknet.business_logic.transaction.objects import InternalTransaction
+from starkware.starknet.definitions import fields
+from starkware.starknet.definitions.l1_da_mode import L1DaMode
 from starkware.starknet.services.api.contract_class.contract_class import EntryPointType
-from starkware.starknet.services.api.gateway.transaction_utils import (
-    rename_contract_address_to_sender_address_pre_load,
+from starkware.starknet.services.api.feeder_gateway.account_transaction_specific_info import (
+    AccountTransactionSpecificInfo,
+)
+from starkware.starknet.services.api.feeder_gateway.deprecated_transaction_specific_info import (
+    DeprecatedTransactionSpecificInfo,
+)
+from starkware.starknet.services.api.feeder_gateway.transaction_specific_info import (
+    TransactionSpecificInfo,
+)
+from starkware.starknet.services.api.feeder_gateway.transaction_specific_info_schema import (
+    TransactionSpecificInfoSchema,
 )
 from starkware.starkware_utils.marshmallow_dataclass_fields import (
     VariadicLengthTupleField,
@@ -64,6 +74,24 @@ LATEST_BLOCK_ID: LatestBlock = "latest"
 PENDING_BLOCK_ID: PendingBlock = "pending"
 
 
+def transaction_specific_info_from_internal(
+    internal_tx: InternalTransaction,
+) -> TransactionSpecificInfo:
+    """
+    Returns a TransactionSpecificInfo object from an InternalTransaction object.
+    Used for backward compatibility.
+    """
+    if isinstance(internal_tx, DeprecatedInternalTransaction):
+        return DeprecatedTransactionSpecificInfo.from_internal(internal_tx=internal_tx)
+    else:
+        return AccountTransactionSpecificInfo.from_internal(internal_tx=internal_tx)
+
+
+class ResponseCallType(Enum):
+    CALL = 0
+    DELEGATE = auto()
+
+
 class BlockStatus(Enum):
     # A pending block; i.e., a block that is yet to be closed.
     PENDING = 0
@@ -73,19 +101,98 @@ class BlockStatus(Enum):
     REVERTED = auto()
     # A block that was created on L2, in contrast to PENDING, which is not yet closed.
     ACCEPTED_ON_L2 = auto()
+    # A block was proven on L2.
+    PROVEN_ON_L2 = auto()
     # A block accepted on L1.
     ACCEPTED_ON_L1 = auto()
 
 
-class TransactionStatus(Enum):
+class FinalityStatus(Enum):
     # The transaction has not been received yet (i.e., not written to storage).
     NOT_RECEIVED = 0
     # The transaction was received by the sequencer.
     RECEIVED = auto()
-    # The transaction failed validation and thus was skipped (applies both to a pending and an
-    # actual created block).
+    # The transaction passed validation and entered a pending or a finalized block.
+    ACCEPTED_ON_L2 = auto()
+    # The transaction was proven on L2.
+    PROVEN_ON_L2 = auto()
+    # The transaction was accepted on-chain.
+    ACCEPTED_ON_L1 = auto()
+
+    def to_deprecated(self) -> "FinalityStatus":
+        if self == FinalityStatus.PROVEN_ON_L2:
+            return FinalityStatus.ACCEPTED_ON_L2
+        return self
+
+    def __ge__(self, other: object) -> bool:
+        if not isinstance(other, FinalityStatus):
+            return NotImplemented
+
+        return self.value >= other.value
+
+    def __lt__(self, other: object) -> bool:
+        return not self >= other
+
+    @property
+    def was_executed(self) -> bool:
+        """
+        Returns True if a transaction with this finality status is in a pending / finalized block.
+        """
+        return self >= FinalityStatus.ACCEPTED_ON_L2
+
+    @classmethod
+    def from_block_status(cls, block_status: BlockStatus) -> "FinalityStatus":
+        """
+        Returns the finality status of a transaction in a block with the given block status.
+        """
+
+        if block_status is BlockStatus.PENDING:
+            # Finality status does not distinguish between pending and finalized blocks -
+            # A pending block will eventually be finalized, so the transaction is considered
+            # accepted on L2.
+            return FinalityStatus.ACCEPTED_ON_L2
+        elif block_status in (
+            BlockStatus.ACCEPTED_ON_L2,
+            BlockStatus.PROVEN_ON_L2,
+            BlockStatus.ACCEPTED_ON_L1,
+        ):
+            return FinalityStatus[block_status.name]
+        elif block_status in (BlockStatus.REVERTED, BlockStatus.ABORTED):
+            # The transaction passed Batcher validations, but the block containing it failed on
+            # L1 or L2. Hence, it is yet again waiting to be inserted to a new block.
+            return FinalityStatus.RECEIVED
+
+        raise NotImplementedError(f"Handling block status {block_status.name} is not implemented.")
+
+
+class ExecutionStatus(Enum):
+    # The transaction failed validation and thus was skipped.
+    REJECTED = 0
+    # The transaction passed validation but failed execution, and will be (or was) included in
+    # a block (nonce will be incremented and an execution fee will be charged).
+    REVERTED = auto()
+    # The transaction passed validation and its execution is valid.
+    SUCCEEDED = auto()
+
+
+class TransactionStatus(Enum):
+    """
+    This class is DEPRECATED and will be removed.
+    It is replaced by ExecutionStatus & FinalityStatus.
+    """
+
+    # The transaction has not been received yet (i.e., not written to storage).
+    NOT_RECEIVED = 0
+    # The transaction was received by the sequencer.
+    RECEIVED = auto()
+    # The transaction failed validation and thus was skipped (applies both to a pending and a
+    # finalized block).
     REJECTED = auto()
-    # The transaction passed the validation and entered a pending or an actual created block.
+    # The transaction passed validation but failed execution, and will be (or was) included in
+    # a block (nonce will be incremented and an execution fee will be charged).
+    # This status does not distinguish between accepted on L2 / accepted on L1 blocks.
+    REVERTED = auto()
+    # The transaction passed validation and entered a pending or a finalized block.
     ACCEPTED_ON_L2 = auto()
     # The transaction was accepted on-chain.
     ACCEPTED_ON_L1 = auto()
@@ -138,6 +245,23 @@ class TransactionStatus(Enum):
     def __lt__(self, other: object) -> bool:
         return not self >= other
 
+    @classmethod
+    def from_new_status(
+        cls, finality_status: FinalityStatus, execution_status: Optional[ExecutionStatus]
+    ) -> "TransactionStatus":
+        """
+        Returns the DEPRECATED status which matches the given finality and execution
+        statuses.
+        """
+        if execution_status in (None, ExecutionStatus.SUCCEEDED):
+            return cls[finality_status.to_deprecated().name]
+
+        assert execution_status in (
+            ExecutionStatus.REVERTED,
+            ExecutionStatus.REJECTED,
+        ), f"Unrecognized execution status {as_non_optional(execution_status).name}."
+        return cls[execution_status.name]
+
 
 # Dictionary that represents the TransactionStatus valid flows.
 # [NOT_RECEIVED] -> [RECEIVED] -> [PENDING] -> [ACCEPTED_ON_L2] -> [ACCEPTED_ON_L1].
@@ -157,8 +281,16 @@ class TransactionInBlockInfo(ValidatedResponseObject):
     Represents the information regarding a StarkNet transaction that appears in a block.
     """
 
-    # The status of a transaction, see TransactionStatus.
+    # The reason for the transaction revert, if applicable.
+    revert_error: Optional[str] = field(metadata=nonrequired_optional_metadata)
+    # Execution status of the transaction.
+    execution_status: Optional[ExecutionStatus] = field(metadata=nonrequired_optional_metadata)
+    # Finality of the transaction.
+    finality_status: FinalityStatus
+    # The status of the transaction.
+    # This field is DEPRECATED and will be removed.
     status: TransactionStatus
+
     # The reason for the transaction failure, if applicable.
     transaction_failure_reason: Optional[TransactionFailureReason]
     # The unique identifier of the block on the active chain containing the transaction.
@@ -174,302 +306,90 @@ class TransactionInBlockInfo(ValidatedResponseObject):
     def __post_init__(self):
         super().__post_init__()
 
-        # Validate NOT_RECEIVED/nonexistent status matches missing execution fields.
-        execution_fields = (
-            self.block_hash,
-            self.block_number,
-            self.transaction_index,
-            self.transaction_failure_reason,
+        # Assert the DEPRECATED status matches execution status and finality status.
+        execution_status_mismatch_msg = (
+            f"DEPRECATED status {self.status} doesn't match "
+            f"execution status {self.execution_status}."
         )
-        if self.status in (
-            TransactionStatus.NOT_RECEIVED,
-            TransactionStatus.RECEIVED,
-        ):
-            assert all(field is None for field in execution_fields), (
-                "Transaction execution fields (block hash, block number, index in block, etc.) "
-                "must not appear in a transaction that is not yet in a block, "
-                "or when status is None. "
-                f"Status: {self.status}. Execution fields: block_hash: {self.block_hash}, "
-                f"block_number: {self.block_number}, transaction_index: {self.transaction_index}, "
-                f"transaction_failure_reason: {self.transaction_failure_reason}."
+        if self.status in (TransactionStatus.REVERTED, TransactionStatus.REJECTED):
+            assert (
+                self.status.name == as_non_optional(self.execution_status).name
+            ), execution_status_mismatch_msg
+        else:
+            assert self.execution_status not in (
+                ExecutionStatus.REVERTED,
+                ExecutionStatus.REJECTED,
+            ), execution_status_mismatch_msg
+            assert self.status.name == as_non_optional(self.finality_status.to_deprecated()).name, (
+                f"DEPRECATED status {self.status} doesn't match finality status "
+                f"{self.finality_status}."
             )
+
+        # Verify fields match for NOT_RECEIVED/RECEIVED finality status.
+        if self.finality_status in (
+            FinalityStatus.NOT_RECEIVED,
+            FinalityStatus.RECEIVED,
+        ):
+            assert all(
+                field is None
+                for field in (
+                    self.block_hash,
+                    self.block_number,
+                    self.transaction_index,
+                    self.revert_error,
+                )
+            ), (
+                f"For a transaction with finality status: {self.finality_status}, the following "
+                f"fields must be None, but are instead: "
+                f"{self.block_hash=}, {self.block_number=}, {self.transaction_index=}, "
+                f"{self.revert_error=}."
+            )
+            if self.execution_status is ExecutionStatus.REJECTED:
+                assert (
+                    self.transaction_failure_reason is not None
+                ), "Rejected transactions must have a failure reason."
+                assert self.finality_status is FinalityStatus.RECEIVED, (
+                    f"The finality status of a rejected transaction should always be RECEIVED. "
+                    f"Instead it's {self.finality_status}."
+                )
+            else:
+                assert (self.execution_status is None) and (
+                    self.transaction_failure_reason is None
+                ), f"For a non-reverted transaction with finality status: {self.finality_status}, "
+                f"the following fields must be None, but are instead: "
+                f"{self.execution_status=}, {self.transaction_failure_reason=}."
 
             return
 
-        # Validate REJECTED status matches existing failure reason field.
-        tx_rejected = self.status is TransactionStatus.REJECTED
-        has_failure_info = self.transaction_failure_reason is not None
-        assert (
-            tx_rejected == has_failure_info
-        ), "A rejected transaction must contain failure information, and vice versa."
+        # At this point finality status should be ACCEPTED_ON_L2/L1.
+        # The following section verifies all fields match for the above cases.
+        assert self.finality_status.was_executed
 
-        # Validate ACCEPTED_ON_L1/2 status matches existing missing created block fields.
-        minimal_remaining_status = TransactionStatus.ACCEPTED_ON_L2
-        assert tx_rejected or self.status >= minimal_remaining_status, (
-            f"Unexpected transaction status: {self.status}; expected status to be at least "
-            f"{minimal_remaining_status.name}."
+        assert self.execution_status in (ExecutionStatus.REVERTED, ExecutionStatus.SUCCEEDED), (
+            f"Accepted (on either L1 or L2) transactions' execution status must be SUCCEEDED or "
+            f"REVERTED. instead it's {self.execution_status}."
         )
 
-        # We do not distinguish between a pending and a finalized block when considering transaction
-        # status. In each case the block hash contains different values therefore we
-        # can't assure its validity.
-        if not tx_rejected:
-            if self.status is TransactionStatus.ACCEPTED_ON_L1:
-                assert all(
-                    field is not None
-                    for field in (self.block_hash, self.block_number, self.transaction_index)
-                ), (
-                    "Block hash, block number and transaction index in block must appear in an "
-                    "accepted transaction."
-                )
-            else:
-                assert self.status is TransactionStatus.ACCEPTED_ON_L2
-                assert all(
-                    field is not None for field in (self.block_number, self.transaction_index)
-                ), (
-                    "Block number and transaction index in block must appear in an "
-                    "accepted transaction."
-                )
+        assert (
+            self.transaction_failure_reason is None
+        ), "Only rejected transactions should have a failure reason."
 
+        # Assert execution status is REVERTED if, and only if, revert error is not None.
+        assert (self.execution_status is ExecutionStatus.REVERTED) == (
+            self.revert_error is not None
+        ), "A transaction must contain revert information if and only if it is reverted."
 
-@marshmallow_dataclass.dataclass(frozen=True)
-class TransactionSpecificInfo(ValidatedResponseObject):
-    transaction_hash: int = field(metadata=fields.transaction_hash_metadata)
-    tx_type: ClassVar[TransactionType]
-    version: int = field(metadata=fields.non_required_tx_version_metadata)
+        assert (self.block_number is not None) and (self.transaction_index is not None), (
+            f"Block number and transaction index in block must appear in Accepted (on either L1 or "
+            f"L2) transactions. Actual values: {self.block_number=}, {self.transaction_index=}."
+        )
 
-    @classmethod
-    def from_internal(cls, internal_tx: InternalTransaction) -> "TransactionSpecificInfo":
-        if isinstance(internal_tx, InternalDeclare):
-            return DeclareSpecificInfo.from_internal_declare(internal_tx=internal_tx)
-        elif isinstance(internal_tx, InternalDeploy):
-            return DeploySpecificInfo.from_internal_deploy(internal_tx=internal_tx)
-        elif isinstance(internal_tx, InternalDeployAccount):
-            return DeployAccountSpecificInfo.from_internal_deploy_account(internal_tx=internal_tx)
-        elif isinstance(internal_tx, InternalInvokeFunction):
-            if internal_tx.entry_point_type is EntryPointType.L1_HANDLER:
-                return L1HandlerSpecificInfo.from_internal_invoke(internal_tx=internal_tx)
+        # ACCEPTED_ON_L2 transactions may be in a non finalized block. In this case the block hash
+        # is not known yet and will be None.
+        if self.finality_status > FinalityStatus.ACCEPTED_ON_L2:
             assert (
-                internal_tx.entry_point_type is EntryPointType.EXTERNAL
-            ), "An InternalInvokeFunction transaction must have EXTERNAL entry point type."
-            return InvokeSpecificInfo.from_internal_invoke(internal_tx=internal_tx)
-        elif isinstance(internal_tx, InternalL1Handler):
-            return L1HandlerSpecificInfo.from_internal_l1_handler(internal_tx=internal_tx)
-        else:
-            raise NotImplementedError(f"No response object for {internal_tx}.")
-
-
-# Mypy has a problem with dataclasses that contain unimplemented abstract methods.
-# See https://github.com/python/mypy/issues/5374 for details on this problem.
-@marshmallow_dataclass.dataclass(frozen=True)  # type: ignore[misc]
-class AccountTransactionSpecificInfo(TransactionSpecificInfo):
-    max_fee: int = field(metadata=fields.fee_metadata)
-    signature: List[int] = field(metadata=fields.signature_metadata)
-    nonce: Optional[int] = field(metadata=fields.optional_nonce_metadata)
-
-    @property
-    @abstractmethod
-    def account_contract_address(self) -> int:
-        """
-        The address of the account contract initiating this transaction.
-        """
-
-
-@marshmallow_dataclass.dataclass(frozen=True)
-class DeclareSpecificInfo(AccountTransactionSpecificInfo):
-    class_hash: int = field(metadata=fields.ClassHashIntField.metadata())
-    compiled_class_hash: Optional[int] = field(
-        metadata=fields.optional_compiled_class_hash_metadata
-    )
-    sender_address: int = field(metadata=fields.contract_address_metadata)
-    # Repeat `nonce` to narrow its type to non-optional int.
-    nonce: int = field(metadata=fields.nonce_metadata)
-
-    tx_type: ClassVar[TransactionType] = TransactionType.DECLARE
-
-    @property
-    def account_contract_address(self) -> int:
-        return self.sender_address
-
-    @classmethod
-    def from_internal_declare(cls, internal_tx: InternalDeclare) -> "DeclareSpecificInfo":
-        return cls(
-            class_hash=internal_tx.class_hash,
-            compiled_class_hash=internal_tx.compiled_class_hash,
-            sender_address=internal_tx.sender_address,
-            nonce=as_non_optional(internal_tx.nonce),
-            max_fee=internal_tx.max_fee,
-            version=internal_tx.version,
-            transaction_hash=internal_tx.hash_value,
-            signature=internal_tx.signature,
-        )
-
-
-@marshmallow_dataclass.dataclass(frozen=True)
-class DeploySpecificInfo(TransactionSpecificInfo):
-    contract_address: int = field(metadata=fields.contract_address_metadata)
-    contract_address_salt: int = field(metadata=fields.contract_address_salt_metadata)
-    class_hash: Optional[int] = field(metadata=fields.OptionalClassHashIntField.metadata())
-    constructor_calldata: List[int] = field(metadata=fields.calldata_as_hex_metadata)
-
-    tx_type: ClassVar[TransactionType] = TransactionType.DEPLOY
-
-    @classmethod
-    def from_internal_deploy(cls, internal_tx: InternalDeploy) -> "DeploySpecificInfo":
-        return cls(
-            contract_address=internal_tx.contract_address,
-            contract_address_salt=internal_tx.contract_address_salt,
-            class_hash=from_bytes(internal_tx.contract_hash),
-            constructor_calldata=internal_tx.constructor_calldata,
-            version=internal_tx.version,
-            transaction_hash=internal_tx.hash_value,
-        )
-
-
-@marshmallow_dataclass.dataclass(frozen=True)
-class DeployAccountSpecificInfo(AccountTransactionSpecificInfo):
-    contract_address: int = field(metadata=fields.contract_address_metadata)
-    contract_address_salt: int = field(metadata=fields.contract_address_salt_metadata)
-    class_hash: int = field(metadata=fields.ClassHashIntField.metadata())
-    constructor_calldata: List[int] = field(metadata=fields.calldata_as_hex_metadata)
-    version: int = field(metadata=fields.tx_version_metadata)
-    # Repeat `nonce` to narrow its type to non-optional int.
-    nonce: int = field(metadata=fields.nonce_metadata)
-
-    tx_type: ClassVar[TransactionType] = TransactionType.DEPLOY_ACCOUNT
-
-    @property
-    def account_contract_address(self) -> int:
-        return self.contract_address
-
-    @classmethod
-    def from_internal_deploy_account(
-        cls, internal_tx: InternalDeployAccount
-    ) -> "DeployAccountSpecificInfo":
-        return cls(
-            # Currently, we keep the old field name `contract_address` in the response object to not
-            # break API.
-            contract_address=internal_tx.sender_address,
-            contract_address_salt=internal_tx.contract_address_salt,
-            class_hash=internal_tx.class_hash,
-            constructor_calldata=internal_tx.constructor_calldata,
-            nonce=internal_tx.nonce,
-            max_fee=internal_tx.max_fee,
-            version=internal_tx.version,
-            transaction_hash=internal_tx.hash_value,
-            signature=internal_tx.signature,
-        )
-
-
-@marshmallow_dataclass.dataclass(frozen=True)
-class InvokeSpecificInfo(AccountTransactionSpecificInfo):
-    sender_address: int = field(metadata=fields.contract_address_metadata)
-    entry_point_selector: Optional[int] = field(
-        metadata=fields.optional_entry_point_selector_metadata
-    )
-    calldata: List[int] = field(metadata=fields.calldata_as_hex_metadata)
-
-    tx_type: ClassVar[TransactionType] = TransactionType.INVOKE_FUNCTION
-
-    @property
-    def account_contract_address(self) -> int:
-        return self.sender_address
-
-    @pre_load
-    def remove_entry_point_type_and_make_selector_optional(
-        self, data: Dict[str, Any], many: bool, **kwargs
-    ) -> Dict[str, List[str]]:
-        if "entry_point_type" in data:
-            del data["entry_point_type"]
-
-        # Version field may be missing in old transactions.
-        raw_version = data.get("version", "0x0")
-        version = fields.TransactionVersionField.load_value(raw_version)
-        if version != 0:
-            data["entry_point_selector"] = None
-        return data
-
-    @pre_load
-    def rename_contract_address_to_sender_address(
-        self, data: Dict[str, Any], many: bool, **kwargs
-    ) -> Dict[str, List[str]]:
-        return rename_contract_address_to_sender_address_pre_load(data=data)
-
-    @post_dump
-    def rename_sender_address_for_old_versions(
-        self, data: Dict[str, Any], many: bool, **kwargs
-    ) -> Dict[str, Any]:
-        version = fields.TransactionVersionField.load_value(data["version"])
-        if version == 0 and "sender_address" in data:
-            assert "contract_address" not in data
-            data["contract_address"] = data.pop("sender_address")
-        return data
-
-    @classmethod
-    def from_internal_invoke(cls, internal_tx: InternalInvokeFunction) -> "InvokeSpecificInfo":
-        return cls(
-            sender_address=internal_tx.sender_address,
-            entry_point_selector=(
-                None if internal_tx.version != 0 else internal_tx.entry_point_selector
-            ),
-            nonce=internal_tx.nonce,
-            calldata=internal_tx.calldata,
-            version=internal_tx.version,
-            signature=internal_tx.signature,
-            transaction_hash=internal_tx.hash_value,
-            max_fee=internal_tx.max_fee,
-        )
-
-
-@marshmallow_dataclass.dataclass(frozen=True)
-class L1HandlerSpecificInfo(TransactionSpecificInfo):
-    contract_address: int = field(metadata=fields.contract_address_metadata)
-    entry_point_selector: int = field(metadata=fields.entry_point_selector_metadata)
-    nonce: Optional[int] = field(metadata=fields.optional_nonce_metadata)
-    calldata: List[int] = field(metadata=fields.calldata_as_hex_metadata)
-
-    tx_type: ClassVar[TransactionType] = TransactionType.L1_HANDLER
-
-    @classmethod
-    def from_internal_l1_handler(cls, internal_tx: InternalL1Handler) -> "L1HandlerSpecificInfo":
-        return cls(
-            contract_address=internal_tx.contract_address,
-            entry_point_selector=internal_tx.entry_point_selector,
-            nonce=internal_tx.nonce,
-            calldata=internal_tx.calldata,
-            version=constants.L1_HANDLER_VERSION,
-            transaction_hash=internal_tx.hash_value,
-        )
-
-    @classmethod
-    def from_internal_invoke(cls, internal_tx: InternalInvokeFunction) -> "L1HandlerSpecificInfo":
-        assert (
-            internal_tx.entry_point_type is EntryPointType.L1_HANDLER
-        ), "This method only accepts InternalInvokeFunction objects that represent L1 Handlers"
-        return cls(
-            contract_address=internal_tx.sender_address,
-            entry_point_selector=internal_tx.entry_point_selector,
-            nonce=internal_tx.nonce,
-            calldata=internal_tx.calldata,
-            version=constants.L1_HANDLER_VERSION,
-            transaction_hash=internal_tx.hash_value,
-        )
-
-
-class TransactionSpecificInfoSchema(OneOfSchema):
-    type_schemas: Dict[str, Type[marshmallow.Schema]] = {
-        TransactionType.DECLARE.name: DeclareSpecificInfo.Schema,
-        TransactionType.DEPLOY.name: DeploySpecificInfo.Schema,
-        TransactionType.DEPLOY_ACCOUNT.name: DeployAccountSpecificInfo.Schema,
-        TransactionType.INVOKE_FUNCTION.name: InvokeSpecificInfo.Schema,
-        TransactionType.L1_HANDLER.name: L1HandlerSpecificInfo.Schema,
-    }
-
-    def get_obj_type(self, obj: TransactionSpecificInfo) -> str:
-        return obj.tx_type.name
-
-
-TransactionSpecificInfo.Schema = TransactionSpecificInfoSchema
+                self.block_hash is not None
+            ), "Transactions that passed the gps ambassador must have a block hash."
 
 
 @marshmallow_dataclass.dataclass(frozen=True)
@@ -478,12 +398,20 @@ class TransactionInfo(TransactionInBlockInfo):
     Represents the information regarding a StarkNet transaction.
     """
 
-    transaction: Optional[TransactionSpecificInfo]
+    transaction: Optional[TransactionSpecificInfo] = field(
+        metadata=additional_metadata(
+            marshmallow_field=mfields.Nested(TransactionSpecificInfoSchema),
+            required=False,
+            load_default=None,
+        )
+    )
 
     @classmethod
     def create(
         cls,
-        status: TransactionStatus,
+        finality_status: FinalityStatus,
+        execution_status: Optional[ExecutionStatus] = None,
+        revert_error: Optional[str] = None,
         transaction: Optional[InternalTransaction] = None,
         transaction_failure_reason: Optional[TransactionFailureReason] = None,
         block_hash: Optional[int] = None,
@@ -491,10 +419,15 @@ class TransactionInfo(TransactionInBlockInfo):
         transaction_index: Optional[int] = None,
     ) -> "TransactionInfo":
         return cls(
+            revert_error=revert_error,
+            execution_status=execution_status,
+            finality_status=finality_status,
             transaction=None
             if transaction is None
-            else TransactionSpecificInfo.from_internal(internal_tx=transaction),
-            status=status,
+            else transaction_specific_info_from_internal(internal_tx=transaction),
+            status=TransactionStatus.from_new_status(
+                finality_status=finality_status, execution_status=execution_status
+            ),
             transaction_failure_reason=transaction_failure_reason,
             block_hash=block_hash,
             block_number=block_number,
@@ -506,7 +439,7 @@ class TransactionInfo(TransactionInBlockInfo):
 
         if self.transaction is None:
             assert (
-                self.status is TransactionStatus.NOT_RECEIVED
+                self.finality_status is FinalityStatus.NOT_RECEIVED
             ), "A received transaction must be included in TransactionInfo object."
 
 
@@ -521,7 +454,7 @@ class L1ToL2Message(ValidatedResponseObject):
     )
     to_address: int = field(metadata=fields.L2AddressField.metadata(field_name="to_address"))
     selector: int = field(metadata=fields.entry_point_selector_metadata)
-    payload: List[int] = field(metadata=fields.felt_as_hex_list_metadata)
+    payload: List[int] = field(metadata=everest_fields.felt_as_hex_list_metadata)
     nonce: Optional[int] = field(metadata=fields.optional_nonce_metadata)
 
 
@@ -535,7 +468,42 @@ class L2ToL1Message(ValidatedResponseObject):
     to_address: str = field(
         metadata=everest_fields.EthAddressField.metadata(field_name="to_address")
     )
-    payload: List[int] = field(metadata=fields.felt_as_hex_list_metadata)
+    payload: List[int] = field(metadata=everest_fields.felt_as_hex_list_metadata)
+
+
+@marshmallow_dataclass.dataclass
+class ReceiptExecutionResources(ValidatedResponseObject):
+    """
+    Contains the execution resources a transaction uses, e.g., the number of Cairo
+    steps and the data availability gas usage.
+    """
+
+    n_steps: int
+    builtin_instance_counter: Dict[str, int]
+    n_memory_holes: int = field(
+        metadata=additional_metadata(marshmallow_field=mfields.Integer(load_default=0))
+    )
+    # The amount of l1_gas or l1_data_gas charged for data availability.
+    # Optional for backwards compatibility.
+    data_availability: Optional[GasVector]
+
+    # The total gas consumed by the transaction. May be None on versions before 0.13.2.
+    total_gas_consumed: Optional[GasVector]
+
+    @classmethod
+    def create(
+        cls,
+        execution_resources: ExecutionResources,
+        da_gas: Optional[GasVector],
+        total_gas_consumed: Optional[GasVector],
+    ) -> "ReceiptExecutionResources":
+        return cls(
+            n_steps=execution_resources.n_steps,
+            builtin_instance_counter=execution_resources.builtin_instance_counter,
+            n_memory_holes=0,
+            data_availability=da_gas,
+            total_gas_consumed=total_gas_consumed,
+        )
 
 
 @marshmallow_dataclass.dataclass(frozen=True)
@@ -543,6 +511,11 @@ class TransactionExecution(ValidatedResponseObject):
     """
     Represents a receipt of an executed transaction.
     """
+
+    # The reason for the transaction revert, if applicable.
+    revert_error: Optional[str] = field(metadata=nonrequired_optional_metadata)
+    # Execution status of the transaction.
+    execution_status: Optional[ExecutionStatus] = field(metadata=nonrequired_optional_metadata)
 
     # The index of the transaction within the block.
     transaction_index: Optional[int] = field(
@@ -557,23 +530,9 @@ class TransactionExecution(ValidatedResponseObject):
     # Events emitted during the execution of the transaction.
     events: List[Event]
     # The resources needed by the transaction.
-    execution_resources: Optional[ExecutionResources]
+    execution_resources: Optional[ReceiptExecutionResources]
     # The actual fee that was charged in Wei.
     actual_fee: Optional[int] = field(metadata=fields.optional_fee_metadata)
-
-
-@marshmallow_dataclass.dataclass(frozen=True)
-class TransactionReceipt(TransactionExecution, TransactionInBlockInfo):
-    """
-    Represents a receipt of a StarkNet transaction;
-    i.e., the information regarding its execution and the block it appears in.
-    """
-
-    def __post_init__(self):
-        super().__post_init__()
-
-        if self.status is TransactionStatus.REJECTED and self.has_execution_info:
-            raise AssertionError("A rejected transaction cannot have execution info.")
 
     @property
     def has_execution_info(self) -> bool:
@@ -585,7 +544,28 @@ class TransactionReceipt(TransactionExecution, TransactionInBlockInfo):
             or self.execution_resources is not None
             or len(self.l2_to_l1_messages) > 0
             or len(self.events) > 0
+            or self.actual_fee is not None
         )
+
+    def __post_init__(self):
+        super().__post_init__()
+        assert (self.execution_status is ExecutionStatus.REVERTED) == (
+            self.revert_error is not None
+        ), (
+            f"A transaction must have a revert error if and only if it is reverted. Actual values: "
+            f"{self.execution_status=}, {self.revert_error=}."
+        )
+
+        if self.execution_status is ExecutionStatus.REJECTED and self.has_execution_info:
+            raise AssertionError("A rejected transaction cannot have execution info.")
+
+
+@marshmallow_dataclass.dataclass(frozen=True)
+class TransactionReceipt(TransactionExecution, TransactionInBlockInfo):
+    """
+    Represents a receipt of a StarkNet transaction;
+    i.e., the information regarding its execution and the block it appears in.
+    """
 
     @classmethod
     def from_tx_info(
@@ -596,9 +576,12 @@ class TransactionReceipt(TransactionExecution, TransactionInBlockInfo):
         l1_to_l2_consumed_message: Optional[L1ToL2Message] = None,
         l2_to_l1_messages: Optional[List[L2ToL1Message]] = None,
         events: Optional[List[Event]] = None,
-        execution_resources: Optional[ExecutionResources] = None,
+        execution_resources: Optional[ReceiptExecutionResources] = None,
     ) -> "TransactionReceipt":
         return cls(
+            revert_error=tx_info.revert_error,
+            execution_status=tx_info.execution_status,
+            finality_status=tx_info.finality_status,
             l1_to_l2_consumed_message=l1_to_l2_consumed_message,
             l2_to_l1_messages=[] if l2_to_l1_messages is None else l2_to_l1_messages,
             events=[] if events is None else events,
@@ -687,11 +670,18 @@ class StateDiff(ValidatedResponseObject):
         self, data: Dict[str, Any], many: bool, **kwargs
     ) -> Dict[str, Any]:
         """
-        Renames the variable "declared_contracts" to "old_declared_contracts".
+        Renames the variable "declared_contracts" to "old_declared_contracts",
+        and Fixes the state diff by removing empty storage diffs.
         """
         if "declared_contracts" in data:
             assert "old_declared_contracts" not in data
             data["old_declared_contracts"] = data.pop("declared_contracts")
+
+        data["storage_diffs"] = {
+            contract_address: storage_entries
+            for contract_address, storage_entries in data["storage_diffs"].items()
+            if len(storage_entries) > 0
+        }
 
         return data
 
@@ -703,8 +693,10 @@ class BlockStateUpdate(ValidatedResponseObject):
     """
 
     block_hash: Optional[int] = field(metadata=fields.optional_block_hash_metadata)
-    new_root: Optional[bytes] = field(metadata=fields.optional_state_root_metadata)
-    old_root: bytes = field(metadata=fields.state_root_metadata)
+    new_root: Optional[int] = field(
+        metadata=fields.backward_compatible_optional_state_root_metadata
+    )
+    old_root: int = field(metadata=fields.backward_compatible_state_root_metadata)
     state_diff: StateDiff
 
     def __post_init__(self):
@@ -712,6 +704,10 @@ class BlockStateUpdate(ValidatedResponseObject):
         assert (self.block_hash is None) == (
             self.new_root is None
         ), "new_root must appear in state update for any block other than pending block."
+
+        assert all(
+            len(storage_entries) > 0 for storage_entries in self.state_diff.storage_diffs.values()
+        ), "Empty storage diffs are not allowed."
 
 
 @dataclasses.dataclass(frozen=True)
@@ -724,7 +720,7 @@ class OrderedL2ToL1MessageResponse(ValidatedDataclass):
     to_address: str = field(
         metadata=everest_fields.EthAddressField.metadata(field_name="to_address")
     )
-    payload: List[int] = field(metadata=fields.felt_as_hex_list_metadata)
+    payload: List[int] = field(metadata=everest_fields.felt_as_hex_list_metadata)
 
     @classmethod
     def from_internal(
@@ -749,8 +745,8 @@ class OrderedEventResponse(ValidatedDataclass):
     """
 
     order: int = field(metadata=sequential_id_metadata("Event order"))
-    keys: List[int] = field(metadata=fields.felt_as_hex_list_metadata)
-    data: List[int] = field(metadata=fields.felt_as_hex_list_metadata)
+    keys: List[int] = field(metadata=everest_fields.felt_as_hex_list_metadata)
+    data: List[int] = field(metadata=everest_fields.felt_as_hex_list_metadata)
 
     @classmethod
     def from_internal(cls, events: List[OrderedEvent]) -> List["OrderedEventResponse"]:
@@ -770,8 +766,8 @@ class FunctionInvocation(BaseResponseObject, SerializableMarshmallowDataclass):
     )
     contract_address: int = field(metadata=fields.contract_address_metadata)
     calldata: List[int] = field(metadata=fields.calldata_as_hex_metadata)
-    call_type: Optional[CallType] = field(metadata=nonrequired_optional_metadata)
-    class_hash: Optional[int] = field(metadata=fields.OptionalClassHashIntField.metadata())
+    call_type: Optional[ResponseCallType] = field(metadata=nonrequired_optional_metadata)
+    class_hash: Optional[int] = field(metadata=fields.optional_new_class_hash_metadata)
     selector: Optional[int] = field(metadata=fields.optional_entry_point_selector_metadata)
     entry_point_type: Optional[EntryPointType]
 
@@ -787,10 +783,23 @@ class FunctionInvocation(BaseResponseObject, SerializableMarshmallowDataclass):
     messages: List[OrderedL2ToL1MessageResponse]
 
     @classmethod
+    def from_inner(cls, call_type: CallType) -> ResponseCallType:
+        if call_type is CallType.Call:
+            return ResponseCallType.CALL
+        elif call_type is CallType.Delegate:
+            return ResponseCallType.DELEGATE
+        else:
+            raise NotImplementedError(f"Unsupported call type {call_type}.")
+
+    @classmethod
     def from_internal(cls, call_info: CallInfo) -> "FunctionInvocation":
         return cls(
             caller_address=call_info.caller_address,
-            call_type=call_info.call_type,
+            call_type=(
+                None
+                if call_info.call_type is None
+                else cls.from_inner(call_type=call_info.call_type)
+            ),
             contract_address=call_info.contract_address,
             class_hash=call_info.class_hash,
             selector=call_info.entry_point_selector,
@@ -822,11 +831,20 @@ class TransactionTrace(ValidatedResponseObject):
     including internal calls.
     """
 
+    # The reason for the transaction revert, if applicable.
+    revert_error: Optional[str] = field(metadata=nonrequired_optional_metadata)
     # Objects describe invocation of validation, fee transfer, and a specific function.
     validate_invocation: Optional[FunctionInvocation]
     function_invocation: Optional[FunctionInvocation]
     fee_transfer_invocation: Optional[FunctionInvocation]
-    signature: List[int] = field(metadata=fields.signature_metadata)
+    signature: List[int] = field(metadata=fields.deprecated_signature_metadata)
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.revert_error is not None:
+            assert (
+                self.function_invocation is None
+            ), "Reverted transactions only execute validation and fee transfer."
 
 
 @marshmallow_dataclass.dataclass(frozen=True)
@@ -854,6 +872,12 @@ class BlockTransactionTraces(ValidatedResponseObject):
 
 
 @marshmallow_dataclass.dataclass(frozen=True)
+class BlockHeader(ValidatedResponseObject):
+    block_hash: int = field(metadata=fields.block_hash_metadata)
+    block_number: int = field(metadata=fields.block_number_metadata)
+
+
+@marshmallow_dataclass.dataclass(frozen=True)
 class StarknetBlock(ValidatedResponseObject):
     """
     Represents a response StarkNet block.
@@ -862,13 +886,24 @@ class StarknetBlock(ValidatedResponseObject):
     block_hash: Optional[int] = field(metadata=fields.optional_block_hash_metadata)
     parent_block_hash: int = field(metadata=fields.block_hash_metadata)
     block_number: Optional[int] = field(metadata=fields.default_optional_block_number_metadata)
-    state_root: Optional[bytes] = field(metadata=fields.optional_state_root_metadata)
+    state_root: Optional[int] = field(
+        metadata=fields.backward_compatible_optional_state_root_metadata
+    )
+    transaction_commitment: Optional[int] = field(metadata=fields.optional_commitment_metadata)
+    event_commitment: Optional[int] = field(metadata=fields.optional_commitment_metadata)
+    receipt_commitment: Optional[int] = field(metadata=fields.optional_commitment_metadata)
+    state_diff_commitment: Optional[int] = field(metadata=fields.optional_commitment_metadata)
+    state_diff_length: Optional[int] = field(
+        metadata=fields.OptionalStateDiffLengthField.metadata()
+    )
     status: Optional[BlockStatus]
-    gas_price: int = field(metadata=fields.gas_price_metadata)
+    l1_da_mode: L1DaMode = field(metadata=fields.l1_da_mode_enum_metadata)
+    l1_gas_price: ResourcePrice
+    l1_data_gas_price: ResourcePrice
     transactions: Tuple[TransactionSpecificInfo, ...] = field(
         metadata=additional_metadata(
             marshmallow_field=VariadicLengthTupleField(
-                mfields.Nested(TransactionSpecificInfo.Schema)
+                mfields.Nested(TransactionSpecificInfoSchema)
             )
         )
     )
@@ -883,33 +918,57 @@ class StarknetBlock(ValidatedResponseObject):
     )
     starknet_version: Optional[str] = field(metadata=fields.starknet_version_metadata)
 
+    @pre_load
+    def rename_old_gas_price_fields(
+        self, data: Dict[str, Any], many: bool, **kwargs
+    ) -> Dict[str, List[str]]:
+        return rename_old_gas_price_fields(data=data)
+
     @classmethod
     def create(
         cls: Type[TBlockInfo],
         block_hash: Optional[int],
+        transaction_commitment: Optional[int],
+        event_commitment: Optional[int],
+        receipt_commitment: Optional[int],
+        state_diff_commitment: Optional[int],
+        state_diff_length: Optional[int],
         parent_block_hash: int,
         block_number: Optional[int],
-        state_root: Optional[bytes],
+        state_root: Optional[int],
         transactions: Iterable[InternalTransaction],
         timestamp: int,
         sequencer_address: Optional[int],
         status: Optional[BlockStatus],
-        gas_price: int,
+        l1_da_mode: L1DaMode,
+        gas_prices: GasPrices,
         transaction_receipts: Optional[Tuple[TransactionExecution, ...]],
         starknet_version: Optional[str],
     ) -> TBlockInfo:
         return cls(
             block_hash=block_hash,
+            transaction_commitment=transaction_commitment,
+            event_commitment=event_commitment,
+            receipt_commitment=receipt_commitment,
+            state_diff_commitment=state_diff_commitment,
+            state_diff_length=state_diff_length,
             parent_block_hash=parent_block_hash,
             block_number=block_number,
             state_root=state_root,
             transactions=tuple(
-                TransactionSpecificInfo.from_internal(internal_tx=tx) for tx in transactions
+                transaction_specific_info_from_internal(internal_tx=tx) for tx in transactions
             ),
             timestamp=timestamp,
             sequencer_address=sequencer_address,
             status=status,
-            gas_price=gas_price,
+            l1_da_mode=l1_da_mode,
+            l1_gas_price=ResourcePrice(
+                price_in_wei=gas_prices.l1_gas_price_wei, price_in_fri=gas_prices.l1_gas_price_fri
+            ),
+            l1_data_gas_price=ResourcePrice(
+                price_in_wei=gas_prices.l1_data_gas_price_wei,
+                price_in_fri=gas_prices.l1_data_gas_price_fri,
+            ),
             transaction_receipts=transaction_receipts,
             starknet_version=starknet_version,
         )
@@ -935,6 +994,41 @@ class StarknetBlock(ValidatedResponseObject):
                 field is not None for field in created_block_fields
             ), "Block hash, block number, state_root must appear in a created block."
 
+    @marshmallow.pre_load
+    def fill_missing_execution_statuses(self, data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+        if data.get("transaction_receipts", None) is None:
+            return data
+
+        have_execution_status = [
+            "execution_status" in tx_receipt for tx_receipt in data["transaction_receipts"]
+        ]
+        if all(have_execution_status):
+            return data
+
+        assert not any(
+            have_execution_status
+        ), "Either all transaction receipts should have execution statuses, or none should."
+        for tx_receipt in data["transaction_receipts"]:
+            tx_receipt["execution_status"] = ExecutionStatus.SUCCEEDED.name
+
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class BlockSignatureInput(ValidatedResponseObject):
+    block_hash: int = field(metadata=fields.block_hash_metadata)
+    state_diff_commitment: int = field(metadata=fields.state_diff_commitment_metadata)
+
+
+@marshmallow_dataclass.dataclass(frozen=True)
+class BlockSignature(ValidatedResponseObject):
+    """
+    Contains the signature of a block.
+    """
+
+    block_hash: int = field(metadata=fields.block_hash_metadata)
+    signature: ECSignature = field(metadata=fields.ec_signature_metadata)
+
 
 @marshmallow_dataclass.dataclass(frozen=True)
 class FeeEstimationInfo(ValidatedResponseObject):
@@ -956,3 +1050,13 @@ class TransactionSimulationInfo(ValidatedResponseObject):
 
     trace: TransactionTrace
     fee_estimation: FeeEstimationInfo
+
+
+@marshmallow_dataclass.dataclass(frozen=True)
+class StarknetBlockAndStateUpdate(ValidatedResponseObject):
+    """
+    Contains both StarknetBlock and BlockStateUpdate objects, corresponding to a certain block.
+    """
+
+    block: StarknetBlock
+    state_update: BlockStateUpdate

@@ -9,6 +9,11 @@ from starkware.cairo.lang.builtins.ec.instance_def import EcOpInstanceDef
 from starkware.cairo.lang.builtins.hash.hash_builtin_runner import HashBuiltinRunner
 from starkware.cairo.lang.builtins.keccak.instance_def import KeccakInstanceDef
 from starkware.cairo.lang.builtins.keccak.keccak_builtin_runner import KeccakBuiltinRunner
+from starkware.cairo.lang.builtins.modulo.instance_def import AddModInstanceDef, MulModInstanceDef
+from starkware.cairo.lang.builtins.modulo.mod_builtin_runner import (
+    AddModBuiltinRunner,
+    MulModBuiltinRunner,
+)
 from starkware.cairo.lang.builtins.poseidon.instance_def import PoseidonInstanceDef
 from starkware.cairo.lang.builtins.poseidon.poseidon_builtin_runner import PoseidonBuiltinRunner
 from starkware.cairo.lang.builtins.range_check.range_check_builtin_runner import (
@@ -37,7 +42,12 @@ class CairoFunctionRunner(CairoRunner):
         )
         self.builtin_runners["pedersen_builtin"] = pedersen_builtin
         range_check_builtin = RangeCheckBuiltinRunner(
-            included=True, ratio=1, inner_rc_bound=2**16, n_parts=8
+            name="range_check",
+            included=True,
+            ratio=1,
+            ratio_den=1,
+            inner_rc_bound=2**16,
+            n_parts=8,
         )
         self.builtin_runners["range_check_builtin"] = range_check_builtin
         output_builtin = OutputBuiltinRunner(included=True)
@@ -81,6 +91,29 @@ class CairoFunctionRunner(CairoRunner):
             ),
         )
         self.builtin_runners["poseidon_builtin"] = poseidon_builtin
+        range_check96_builtin = RangeCheckBuiltinRunner(
+            name="range_check96",
+            included=True,
+            ratio=1,
+            ratio_den=1,
+            inner_rc_bound=2**16,
+            n_parts=6,
+        )
+        self.builtin_runners["range_check96_builtin"] = range_check96_builtin
+        add_mod_builtin = AddModBuiltinRunner(
+            included=True,
+            instance_def=AddModInstanceDef(
+                word_bit_len=96, n_words=4, batch_size=1, ratio=1, ratio_den=1
+            ),
+        )
+        self.builtin_runners["add_mod_builtin"] = add_mod_builtin
+        mul_mod_builtin = MulModBuiltinRunner(
+            included=True,
+            instance_def=MulModInstanceDef(
+                word_bit_len=96, n_words=4, batch_size=1, ratio=1, ratio_den=1
+            ),
+        )
+        self.builtin_runners["mul_mod_builtin"] = mul_mod_builtin
 
         self.initialize_segments()
 
@@ -116,6 +149,18 @@ class CairoFunctionRunner(CairoRunner):
     def poseidon_builtin(self) -> PoseidonBuiltinRunner:
         return cast(PoseidonBuiltinRunner, self.builtin_runners["poseidon_builtin"])
 
+    @property
+    def range_check96_builtin(self) -> RangeCheckBuiltinRunner:
+        return cast(RangeCheckBuiltinRunner, self.builtin_runners["range_check96_builtin"])
+
+    @property
+    def add_mod_builtin(self) -> AddModBuiltinRunner:
+        return cast(AddModBuiltinRunner, self.builtin_runners["add_mod_builtin"])
+
+    @property
+    def mul_mod_builtin(self) -> MulModBuiltinRunner:
+        return cast(MulModBuiltinRunner, self.builtin_runners["mul_mod_builtin"])
+
     def assert_eq(self, arg: MaybeRelocatable, expected_value, apply_modulo: bool = True):
         """
         Asserts that arg is the Cairo representation of expected_value.
@@ -146,6 +191,7 @@ class CairoFunctionRunner(CairoRunner):
         apply_modulo_to_args: Optional[bool] = None,
         use_full_name: bool = False,
         verify_implicit_args_segment: bool = False,
+        allow_tmp_segments: bool = False,
         **kwargs,
     ) -> Tuple[Tuple[MaybeRelocatable, ...], Tuple[MaybeRelocatable, ...]]:
         """
@@ -183,6 +229,7 @@ class CairoFunctionRunner(CairoRunner):
                 static_locals=static_locals,
                 verify_secure=verify_secure,
                 apply_modulo_to_args=apply_modulo_to_args,
+                allow_tmp_segments=allow_tmp_segments,
             )
         except (VmException, SecurityError, AssertionError) as ex:
             if trace_on_failure:

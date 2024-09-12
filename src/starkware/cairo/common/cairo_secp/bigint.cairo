@@ -1,26 +1,8 @@
+from starkware.cairo.common.cairo_secp.bigint3 import BigInt3, UnreducedBigInt3
 from starkware.cairo.common.cairo_secp.constants import BASE
 from starkware.cairo.common.math import assert_nn, assert_nn_le, unsigned_div_rem
 from starkware.cairo.common.math_cmp import RC_BOUND
 from starkware.cairo.common.uint256 import Uint256
-
-// Represents a big integer defined by:
-//   d0 + BASE * d1 + BASE**2 * d2.
-// Note that the limbs (d_i) are NOT restricted to the range [0, BASE) and in particular they
-// can be negative.
-// In most cases this is used to represent a secp256k1 field element.
-struct UnreducedBigInt3 {
-    d0: felt,
-    d1: felt,
-    d2: felt,
-}
-
-// Same as UnreducedBigInt3, except that d0, d1 and d2 must be in the range [0, 3 * BASE).
-// In most cases this is used to represent a secp256k1 field element.
-struct BigInt3 {
-    d0: felt,
-    d1: felt,
-    d2: felt,
-}
 
 // Represents a big integer defined by:
 //   sum_i(BASE**i * d_i).
@@ -95,17 +77,20 @@ func nondet_bigint3{range_check_ptr}() -> (res: BigInt3) {
 func bigint_to_uint256{range_check_ptr}(x: BigInt3) -> (res: Uint256) {
     let low = [range_check_ptr];
     let high = [range_check_ptr + 1];
-    let range_check_ptr = range_check_ptr + 2;
+
+    // Guess the low part of the result. This is done by taking the 128 LSB of x.
     %{ ids.low = (ids.x.d0 + ids.x.d1 * ids.BASE) & ((1 << 128) - 1) %}
-    // Because PRIME is at least 174 bits, the numerator doesn't overflow.
-    tempvar a = ((x.d0 + x.d1 * BASE) - low) / RC_BOUND;
-    const D2_SHIFT = BASE * BASE / RC_BOUND;
-    const A_BOUND = 4 * D2_SHIFT;
-    // We'll check that the division in `a` doesn't cause an overflow. This means that the 128 LSB
-    // of (x.d0 + x.d1 * BASE) and low are identical, which ensures that low is correct.
-    assert_nn_le(a, A_BOUND - 1);
-    // high * RC_BOUND = a * RC_BOUND + x.d2 * BASE ** 2 =
-    //   = x.d0 + x.d1 * BASE + x.d2 * BASE ** 2 - low = num - low.
+
+    // Verify that low is indeed the 128 LSB of (x.d0 + x.d1 * BASE). This is done by
+    // checking that the following division doesn't overflow.
+    tempvar a = ((x.d0 + x.d1 * BASE) - low) / 2 ** 128;
+
+    // 'a' should be in the range [0, 2 ** 46), since (x.d0 + x.d1 * BASE) < 2 ** 174.
+    assert [range_check_ptr + 2] = a;
+    assert [range_check_ptr + 3] = a + 2 ** 128 - 2 ** 46;
+    let range_check_ptr = range_check_ptr + 4;
+
+    const D2_SHIFT = BASE * BASE / 2 ** 128;
     with_attr error_message("x out of range") {
         assert high = a + x.d2 * D2_SHIFT;
     }

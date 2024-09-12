@@ -1,11 +1,16 @@
 import math
 import random
 from hashlib import sha256
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import sympy
-from sympy.core.numbers import igcdex
+
+# Custom import of igcdex to support multiple sympy versions.
+try:
+    from sympy.core.numbers import igcdex
+except (ModuleNotFoundError, ImportError):
+    from sympy.core.intfunc import igcdex  # type: ignore[no-redef]
 
 
 def safe_div(x: int, y: int):
@@ -65,6 +70,11 @@ def prev_power_of_2(x: int):
     return next_power_of_2(x + 1) // 2
 
 
+def log2_ceil(x: int):
+    assert x > 0
+    return (x - 1).bit_length()
+
+
 def is_quad_residue(n, p):
     """
     Returns True if n is a quadratic residue mod p.
@@ -80,6 +90,15 @@ def safe_log2(x: int):
     res = int(math.log(x, 2))
     assert 2**res == x
     return res
+
+
+def exponent_to_numerator_denominator(exponent: int) -> Tuple[int, int]:
+    """
+    Returns the numerator and denominator of 2**exponent.
+    """
+    numerator = 2**exponent if exponent >= 0 else 1
+    denominator = 1 if exponent >= 0 else 2 ** (-exponent)
+    return numerator, denominator
 
 
 def sqrt(n, p):
@@ -114,6 +133,8 @@ class EcInfinity:
 
 
 EC_INFINITY = EcInfinity()
+
+EcPoint = Union[Tuple[int, int], EcInfinity]
 
 
 def line_slope(point1: Tuple[int, int], point2: Tuple[int, int], p: int) -> int:
@@ -190,9 +211,7 @@ def ec_mult(m, point, alpha, p):
     return ec_add(ec_mult(m - 1, point, alpha, p), point, p)
 
 
-def ec_safe_mult(
-    m: int, point: Tuple[int, int], alpha: int, p: int
-) -> Union[Tuple[int, int], EcInfinity]:
+def ec_safe_mult(m: int, point: EcPoint, alpha: int, p: int) -> EcPoint:
     """
     Multiplies by m a point on the elliptic curve with equation y^2 = x^3 + alpha*x + beta mod p.
     Assumes the point is given in affine form (x, y).
@@ -280,3 +299,46 @@ def safe_random_ec_point(
     res = ec_safe_mult(m=random.randrange(1, curve_order), point=generator, alpha=alpha, p=prime)
     assert not isinstance(res, EcInfinity)
     return res
+
+
+def fft(coeffs: List[int], generator: int, prime: int, bit_reversed: bool = False) -> List[int]:
+    """
+    Computes the FFT of `coeffs`, assuming the size of the coefficient array is a power of two
+    and equals to the generator's multiplicative order.
+    """
+
+    def _fft(coeffs: np.ndarray, group: np.ndarray) -> np.ndarray:
+        if len(coeffs) == 1:
+            return np.array(coeffs)
+
+        f_even = _fft(coeffs=coeffs[::2], group=group[::2])
+        f_odd = _fft(coeffs=coeffs[1::2], group=group[::2])
+
+        group_mul_f_odd = (group[: len(f_odd)] * f_odd) % prime
+        return np.concatenate(
+            (
+                (f_even + group_mul_f_odd) % prime,
+                (f_even - group_mul_f_odd) % prime,
+            )
+        )
+
+    if len(coeffs) == 0:
+        return []
+
+    coeffs_len = len(coeffs)
+    assert is_power_of_2(coeffs_len), "Length is not a power of two."
+
+    # Prepare sample points.
+    group = [1]
+    for _ in range(coeffs_len - 1):
+        group.append((group[-1] * generator) % prime)
+
+    # Evaluate.
+    values = list(_fft(coeffs=np.array(coeffs), group=np.array(group)))
+
+    if bit_reversed:
+        width = coeffs_len.bit_length() - 1
+        perm = [int("{:0{width}b}".format(i, width=width)[::-1], 2) for i in range(coeffs_len)]
+        return [values[i] for i in perm]
+
+    return values

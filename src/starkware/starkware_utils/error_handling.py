@@ -32,6 +32,8 @@ class StarkErrorCode(ErrorCode):
     BATCH_NOT_READY = auto()
     #: Connection error with the node (for example, Infura too many requests).
     CONNECTION_ERROR = auto()
+    #: Connection error with a client.
+    CONNECTION_RESET_ERROR = auto()
     #: Duplicate order.
     DUPLICATE_ORDER = auto()
     #: Multi-Transaction with zero transactions.
@@ -124,6 +126,8 @@ class StarkErrorCode(ErrorCode):
     OUT_OF_RANGE_ORDER_ID = auto()
     #: Positive amount value is out of range.
     OUT_OF_RANGE_POSITIVE_AMOUNT = auto()
+    #: Private key value is out of range.
+    OUT_OF_RANGE_PRIVATE_KEY = auto()
     #: Public key (Stark key) value is out of range.
     OUT_OF_RANGE_PUBLIC_KEY = auto()
     #: Risk factor segment upper bound is out of range.

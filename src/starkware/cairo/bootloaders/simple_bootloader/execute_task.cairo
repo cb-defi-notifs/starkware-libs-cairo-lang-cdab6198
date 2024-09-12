@@ -1,6 +1,7 @@
 from starkware.cairo.builtin_selection.inner_select_builtins import inner_select_builtins
 from starkware.cairo.builtin_selection.select_input_builtins import select_input_builtins
 from starkware.cairo.builtin_selection.validate_builtins import validate_builtins
+from starkware.cairo.common.builtin_poseidon.poseidon import PoseidonBuiltin, poseidon_hash_many
 from starkware.cairo.common.cairo_builtins import HashBuiltin
 from starkware.cairo.common.hash_chain import hash_chain
 from starkware.cairo.common.registers import get_ap, get_fp_and_pc
@@ -32,6 +33,29 @@ struct BuiltinData {
     ec_op: felt,
     keccak: felt,
     poseidon: felt,
+    range_check96: felt,
+    add_mod: felt,
+    mul_mod: felt,
+}
+
+// Computes the hash of a program.
+// Arguments:
+//  * program_data_ptr - the pointer to the program to be hashed.
+//  * use_poseidon - a flag that determines whether the hashing will use Poseidon hash.
+// Return values:
+//  * hash - the computed program hash.
+func compute_program_hash{pedersen_ptr: HashBuiltin*, poseidon_ptr: PoseidonBuiltin*}(
+    program_data_ptr: felt*, use_poseidon: felt
+) -> (hash: felt) {
+    if (use_poseidon == 1) {
+        let (hash) = poseidon_hash_many{poseidon_ptr=poseidon_ptr}(
+            n=program_data_ptr[0], elements=&program_data_ptr[1]
+        );
+        return (hash=hash);
+    } else {
+        let (hash) = hash_chain{hash_ptr=pedersen_ptr}(data_ptr=program_data_ptr);
+        return (hash=hash);
+    }
 }
 
 // Executes a single task.
@@ -41,7 +65,7 @@ struct BuiltinData {
 //   b. hash_chain(ProgramHeader || task.program.data) where ProgramHeader is defined below.
 // The function returns a pointer to the updated builtin pointers after executing the task.
 func execute_task{builtin_ptrs: BuiltinData*, self_range_check_ptr}(
-    builtin_encodings: BuiltinData*, builtin_instance_sizes: BuiltinData*
+    builtin_encodings: BuiltinData*, builtin_instance_sizes: BuiltinData*, use_poseidon: felt
 ) {
     // Allocate memory for local variables.
     alloc_locals;
@@ -73,15 +97,22 @@ func execute_task{builtin_ptrs: BuiltinData*, self_range_check_ptr}(
 
     // Call hash_chain, to verify the program hash.
     let pedersen_ptr = cast(input_builtin_ptrs.pedersen, HashBuiltin*);
-    let (hash) = hash_chain{hash_ptr=pedersen_ptr}(data_ptr=program_data_ptr);
+    let poseidon_ptr = cast(input_builtin_ptrs.poseidon, PoseidonBuiltin*);
+    with pedersen_ptr, poseidon_ptr {
+        let (hash) = compute_program_hash(
+            program_data_ptr=program_data_ptr, use_poseidon=use_poseidon
+        );
+    }
+
     // Write hash_chain result to output_ptr + 1.
     assert [output_ptr + 1] = hash;
     %{
         # Validate hash.
         from starkware.cairo.bootloaders.hash_program import compute_program_hash_chain
 
-        assert memory[ids.output_ptr + 1] == compute_program_hash_chain(task.get_program()), \
-          'Computed hash does not match input.'
+        assert memory[ids.output_ptr + 1] == compute_program_hash_chain(
+            program=task.get_program(),
+            use_poseidon=bool(ids.use_poseidon)), 'Computed hash does not match input.'
     %}
 
     // Set the program entry point, so the bootloader can later run the program.
@@ -106,7 +137,10 @@ func execute_task{builtin_ptrs: BuiltinData*, self_range_check_ptr}(
         bitwise=input_builtin_ptrs.bitwise,
         ec_op=input_builtin_ptrs.ec_op,
         keccak=input_builtin_ptrs.keccak,
-        poseidon=input_builtin_ptrs.poseidon,
+        poseidon=cast(poseidon_ptr, felt),
+        range_check96=input_builtin_ptrs.range_check96,
+        add_mod=input_builtin_ptrs.add_mod,
+        mul_mod=input_builtin_ptrs.mul_mod,
     );
 
     // Call select_input_builtins to get the relevant input builtin pointers for the task.

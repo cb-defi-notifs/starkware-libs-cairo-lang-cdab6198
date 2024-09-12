@@ -30,6 +30,7 @@ STARKNET_OLD_SYSCALLS_COMPILED_PATH = os.path.join(
 STARKNET_SYSCALLS_COMPILED_PATH = os.path.join(
     os.path.dirname(__file__), "starknet_new_syscalls.json"
 )
+STARKNET_BUILTINS_COMPILED_PATH = os.path.join(os.path.dirname(__file__), "starknet_builtins.json")
 
 # New syscalls utilities.
 
@@ -37,6 +38,12 @@ STARKNET_SYSCALLS_COMPILED_PATH = os.path.join(
 @cachetools.cached(cache={})
 def get_syscall_structs() -> CairoStructProxy:
     syscalls_program = load_program(path=STARKNET_SYSCALLS_COMPILED_PATH)
+    return CairoStructFactory.from_program(program=syscalls_program, additional_imports=[]).structs
+
+
+@cachetools.cached(cache={})
+def get_builtins_structs() -> CairoStructProxy:
+    syscalls_program = load_program(path=STARKNET_BUILTINS_COMPILED_PATH)
     return CairoStructFactory.from_program(program=syscalls_program, additional_imports=[]).structs
 
 
@@ -227,7 +234,7 @@ def get_runtime_type(
     """
     if isinstance(cairo_type, TypeFelt):
         return int
-    if isinstance(cairo_type, TypePointer) and isinstance(cairo_type.pointee, TypeFelt):
+    if isinstance(cairo_type, TypePointer):
         return RelocatableValue
     if isinstance(cairo_type, TypeStruct) and cairo_type.scope == ScopedName.from_string(
         "starkware.cairo.common.uint256.Uint256"

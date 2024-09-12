@@ -1,14 +1,13 @@
 from starkware.cairo.common.alloc import alloc
 from starkware.cairo.common.cairo_blake2s.blake2s import finalize_blake2s
-from starkware.cairo.common.cairo_builtins import BitwiseBuiltin
+from starkware.cairo.common.cairo_builtins import BitwiseBuiltin, PoseidonBuiltin
 from starkware.cairo.common.hash import HashBuiltin
-from starkware.cairo.common.uint256 import Uint256
+from starkware.cairo.stark_verifier.air.config_instances import TracesConfig
 from starkware.cairo.stark_verifier.core.air_interface import (
     AirInstance,
     OodsEvaluationInfo,
     PublicInput,
     TracesCommitment,
-    TracesConfig,
     TracesDecommitment,
     TracesUnsentCommitment,
     TracesWitness,
@@ -25,14 +24,14 @@ from starkware.cairo.stark_verifier.core.channel import (
     ChannelUnsentFelt,
     channel_new,
     random_felts_to_prover,
-    read_felts_from_prover,
+    read_felt_vector_from_prover,
 )
 from starkware.cairo.stark_verifier.core.config import (
-    StarkConfig,
     StarkDomains,
     stark_config_validate,
     stark_domains_create,
 )
+from starkware.cairo.stark_verifier.core.config_instances import StarkConfig
 from starkware.cairo.stark_verifier.core.fri.fri import (
     FriCommitment,
     FriConfig,
@@ -143,9 +142,12 @@ struct InteractionValuesAfterOods {
 }
 
 // Verifies a STARK proof.
-func verify_stark_proof{range_check_ptr, pedersen_ptr: HashBuiltin*, bitwise_ptr: BitwiseBuiltin*}(
-    air: AirInstance*, proof: StarkProof*, security_bits: felt
-) -> () {
+func verify_stark_proof{
+    range_check_ptr,
+    pedersen_ptr: HashBuiltin*,
+    bitwise_ptr: BitwiseBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
+}(air: AirInstance*, proof: StarkProof*, security_bits: felt) -> () {
     alloc_locals;
 
     // Validate config.
@@ -161,9 +163,7 @@ func verify_stark_proof{range_check_ptr, pedersen_ptr: HashBuiltin*, bitwise_ptr
     local blake2s_ptr_start: felt* = blake2s_ptr;
 
     // Compute the initial hash seed for the Fiat-Shamir channel.
-    let (digest) = public_input_hash{blake2s_ptr=blake2s_ptr}(
-        air=air, public_input=proof.public_input
-    );
+    let (digest) = public_input_hash(air=air, public_input=proof.public_input, config=config);
 
     // Construct the channel.
     let (channel: Channel) = channel_new(digest=digest);
@@ -204,6 +204,7 @@ func stark_commit{
     blake2s_ptr: felt*,
     pedersen_ptr: HashBuiltin*,
     bitwise_ptr: BitwiseBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
     channel: Channel,
 }(
     air: AirInstance*,
@@ -249,7 +250,7 @@ func stark_commit{
 
     // Read OODS values.
     local n_oods_values = air.mask_size + air.constraint_degree;
-    let (sent_oods_values) = read_felts_from_prover(
+    let (sent_oods_values) = read_felt_vector_from_prover(
         n_values=n_oods_values, values=unsent_commitment.oods_values
     );
 
@@ -326,7 +327,11 @@ func verify_oods{range_check_ptr}(
 
 // STARK decommitment phase.
 func stark_decommit{
-    range_check_ptr, blake2s_ptr: felt*, pedersen_ptr: HashBuiltin*, bitwise_ptr: BitwiseBuiltin*
+    range_check_ptr,
+    blake2s_ptr: felt*,
+    pedersen_ptr: HashBuiltin*,
+    bitwise_ptr: BitwiseBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
 }(
     air: AirInstance*,
     public_input: PublicInput*,

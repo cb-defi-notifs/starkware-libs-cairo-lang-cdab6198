@@ -19,9 +19,7 @@ py_library(
         "error_handling.py",
     ],
     visibility = ["//visibility:public"],
-    deps = [
-        requirement("marshmallow"),
-    ],
+    deps = [requirement("marshmallow")],
 )
 
 py_library(
@@ -45,9 +43,9 @@ py_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "starkware_custom_dict_utils_lib",
-        "starkware_error_handling_lib",
-        "starkware_serializability_utils_lib",
+        ":starkware_custom_dict_utils_lib",
+        ":starkware_error_handling_lib",
+        ":starkware_serializability_utils_lib",
         "//src/starkware/python:starkware_python_utils_lib",
         requirement("frozendict"),
         requirement("marshmallow"),
@@ -78,7 +76,7 @@ py_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "starkware_dataclasses_utils_lib",
+        ":starkware_dataclasses_utils_lib",
         "//src/starkware/crypto:starkware_crypto_lib",
         requirement("eth_utils"),
         requirement("marshmallow"),
@@ -93,7 +91,7 @@ py_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "starkware_dataclasses_field_utils_lib",
+        ":starkware_dataclasses_utils_lib",
         requirement("marshmallow"),
         requirement("pyyaml"),
     ],
@@ -122,6 +120,7 @@ py_library(
         "//src/starkware/starkware_utils/commitment_tree:calculation.py",
         "//src/starkware/starkware_utils/commitment_tree:update_tree.py",
         "//src/starkware/starkware_utils/commitment_tree/merkle_tree:traverse_tree.py",
+        "//src/starkware/starkware_utils/commitment_tree/patricia_tree:fast_patricia_update.py",
         "//src/starkware/starkware_utils/commitment_tree/patricia_tree:nodes.py",
         "//src/starkware/starkware_utils/commitment_tree/patricia_tree:patricia_tree.py",
         "//src/starkware/starkware_utils/commitment_tree/patricia_tree:virtual_calculation_node.py",
@@ -129,12 +128,9 @@ py_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "starkware_commitment_tree_facts_lib",
-        "starkware_config_utils_lib",
-        "starkware_custom_dict_utils_lib",
-        "starkware_dataclasses_field_utils_lib",
-        "starkware_error_handling_lib",
-        "starkware_serializability_utils_lib",
+        ":starkware_commitment_tree_facts_lib",
+        ":starkware_dataclasses_field_utils_lib",
+        ":starkware_dataclasses_utils_lib",
         "//src/starkware/python:starkware_python_utils_lib",
         "//src/starkware/storage:starkware_abstract_storage_lib",
         requirement("marshmallow_dataclass"),

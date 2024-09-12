@@ -1,6 +1,7 @@
 load("//bazel_utils:solidity.bzl", "sol_contract", "sol_library")
 load("//bazel_utils/python:defs.bzl", "requirement")
 load("//bazel_utils:python.bzl", "pytest_test")
+load("//src/starkware/cairo/lang:cairo_rules.bzl", "cairo_library")
 
 sol_library(
     name = "starknet_mock_messaging_sol",
@@ -18,6 +19,7 @@ sol_contract(
     contracts = [
         "MockStarknetMessaging.json",
     ],
+    solc_exe = "//bazel_utils:solc-0.8.24",
     deps = [
         "starknet_mock_messaging_sol",
     ],
@@ -32,8 +34,19 @@ py_library(
         ":mock_starknet_messaging_sol_env",
     ],
     visibility = ["//visibility:public"],
+    deps = ["//src/starkware/solidity:starkware_contracts_utils_lib"],
+)
+
+cairo_library(
+    name = "starknet_testing_cairo_lib",
+    srcs = [
+        "test.cairo",
+        "test_cairo1.cairo",
+        "test_unwhitelisted_hint.cairo",
+    ],
     deps = [
-        "//src/starkware/solidity:starkware_contracts_utils_lib",
+        "//src/starkware/cairo/common:cairo_common_cairo_lib",
+        "//src/starkware/starknet/common:starknet_common_cairo_lib",
     ],
 )
 
@@ -46,19 +59,21 @@ pytest_test(
         "postman_test.py",
         "starknet_test.py",
     ],
-    data = [
-        "test.cairo",
-        "test_cairo1.cairo",
-        "test_unwhitelisted_hint.cairo",
-    ],
+    data = [":starknet_testing_cairo_lib"],
     visibility = ["//visibility:public"],
     deps = [
-        "starknet_mock_messaging_contracts_lib",
-        "starknet_testing_lib",
-        "//src/starkware/cairo/common:cairo_common_lib",
+        ":starknet_mock_messaging_contracts_lib",
+        ":starknet_testing_lib",
+        "//src/starkware/cairo/lang/compiler:cairo_compile_lib",
         "//src/starkware/eth:starkware_eth_test_utils_lib",
+        "//src/starkware/starknet/business_logic/execution:starknet_transaction_execution_objects_lib",
+        "//src/starkware/starknet/compiler:starknet_compile_lib",
         "//src/starkware/starknet/compiler/v1:starknet_compile_v1_lib",
         "//src/starkware/starknet/core/test_contract:starknet_test_external_contract_test_utils_lib",
+        "//src/starkware/starknet/public:starknet_abi_lib",
+        "//src/starkware/starknet/services/api:starknet_messages_lib",
+        "//src/starkware/starknet/services/api/contract_class:starknet_contract_class_lib",
+        "//src/starkware/starknet/utils:starknet_api_utils_lib",
         requirement("pytest_asyncio"),
     ],
 )
@@ -70,11 +85,9 @@ py_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "//src/starkware/starknet/business_logic/transaction:starknet_transaction_objects_lib",
+        "//src/starkware/starknet/business_logic/transaction:starknet_transaction_deprecated_objects_lib",
         "//src/starkware/starknet/core/os/contract_address:starknet_contract_address_lib",
-        "//src/starkware/starknet/core/os/contract_class:starknet_os_abi_lib",
         "//src/starkware/starknet/public:starknet_abi_lib",
-        "//src/starkware/starknet/services/api/contract_class:starknet_contract_class_lib",
     ],
 )
 
@@ -92,10 +105,10 @@ py_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "starknet_mock_messaging_contracts_lib",
+        ":starknet_mock_messaging_contracts_lib",
+        ":starknet_testing_test_utils_lib",
         "//src/starkware/cairo/lang/compiler:cairo_compile_lib",
         "//src/starkware/cairo/lang/vm:cairo_vm_crypto_lib",
-        "//src/starkware/cairo/lang/vm:cairo_vm_lib",
         "//src/starkware/eth:starkware_eth_test_utils_lib",
         "//src/starkware/eth:web3_wrapper_lib",
         "//src/starkware/python:starkware_python_utils_lib",
@@ -104,7 +117,7 @@ py_library(
         "//src/starkware/starknet/business_logic/fact_state:starknet_business_logic_fact_state_lib",
         "//src/starkware/starknet/business_logic/fact_state:starknet_business_logic_patricia_state_lib",
         "//src/starkware/starknet/business_logic/state:starknet_business_logic_state_lib",
-        "//src/starkware/starknet/business_logic/transaction:starknet_transaction_objects_lib",
+        "//src/starkware/starknet/business_logic/transaction:starknet_transaction_deprecated_objects_lib",
         "//src/starkware/starknet/compiler:starknet_compile_lib",
         "//src/starkware/starknet/compiler/v1:starknet_compile_v1_lib",
         "//src/starkware/starknet/core/os/contract_class:starknet_os_abi_lib",
@@ -115,14 +128,12 @@ py_library(
         "//src/starkware/starknet/services/api:starknet_messages_lib",
         "//src/starkware/starknet/services/api/contract_class:starknet_contract_class_lib",
         "//src/starkware/starknet/services/api/contract_class:starknet_contract_class_utils_lib",
-        "//src/starkware/starknet/services/api/feeder_gateway:starknet_feeder_gateway_response_objects_lib",
-        "//src/starkware/starknet/services/api/gateway:starknet_transaction_lib",
-        "//src/starkware/starknet/testing:starknet_testing_test_utils_lib",
+        "//src/starkware/starknet/services/api/feeder_gateway:response_objects",
+        "//src/starkware/starknet/services/api/gateway:starknet_deprecated_transaction_lib",
         "//src/starkware/starknet/utils:starknet_api_utils_lib",
         "//src/starkware/starkware_utils:starkware_dataclasses_utils_lib",
         "//src/starkware/storage:starkware_abstract_storage_lib",
         "//src/starkware/storage:starkware_dict_storage_lib",
-        "//src/starkware/storage:starkware_storage_lib",
         requirement("typeguard"),
     ],
 )

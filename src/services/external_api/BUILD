@@ -13,8 +13,6 @@ py_library(
         "utils.py",
     ],
     visibility = ["//visibility:public"],
-    deps = [
-    ],
 )
 
 py_library(
@@ -25,9 +23,9 @@ py_library(
     ] + SERVICES_EXTERNAL_API_LIB_ADDITIONAL_FILES,
     visibility = ["//visibility:public"],
     deps = [
-        "services_external_api_utils_lib",
-        "//src/starkware/starkware_utils:starkware_dataclasses_field_utils_lib",
+        ":services_external_api_utils_lib",
         "//src/starkware/python:starkware_python_utils_lib",
+        "//src/starkware/starkware_utils:starkware_dataclasses_field_utils_lib",
         requirement("aiohttp"),
     ] + SERVICES_EXTERNAL_API_LIB_ADDITIONAL_LIBS,
 )
@@ -38,6 +36,5 @@ py_library(
         "eth_gas_constants.py",
     ],
     visibility = ["//visibility:public"],
-    deps = [
-    ],
+    deps = [],
 )

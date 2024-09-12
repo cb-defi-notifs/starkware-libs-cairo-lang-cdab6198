@@ -1,13 +1,23 @@
+from collections import defaultdict
 from typing import Collection, Dict, List, Optional, Tuple, Type
 
 import marshmallow_dataclass
 
+from starkware.python.utils_stub_module import safe_zip
 from starkware.starkware_utils.commitment_tree.binary_fact_tree import (
     BinaryFactDict,
     BinaryFactTree,
     TLeafFact,
 )
 from starkware.starkware_utils.commitment_tree.leaf_fact import LeafFact
+from starkware.starkware_utils.commitment_tree.patricia_tree.fast_patricia_update import (
+    SubTree,
+    TreeContext,
+    fetch_nodes,
+)
+from starkware.starkware_utils.commitment_tree.patricia_tree.fast_patricia_update import (
+    update_tree as update_tree_efficiently,
+)
 from starkware.starkware_utils.commitment_tree.patricia_tree.nodes import EmptyNodeFact
 from starkware.starkware_utils.commitment_tree.patricia_tree.virtual_calculation_node import (
     VirtualCalculationNode,
@@ -78,6 +88,21 @@ class PatriciaTree(BinaryFactTree):
         root_hash = await updated_virtual_root_node.commit(ffc=ffc, facts=facts)
         return PatriciaTree(root=root_hash, height=updated_virtual_root_node.height)
 
+    async def update_efficiently(
+        self,
+        ffc: FactFetchingContext,
+        modifications: Collection[Tuple[int, LeafFact]],
+    ) -> "PatriciaTree":
+        """
+        Updates the tree with the given list of modifications, writes all the new facts to the
+        storage and returns a new PatriciaTree representing the fact of the root of the new tree.
+        This method is more efficient than `update`.
+        """
+        updated_root = await update_tree_efficiently(
+            height=self.height, root=self.root, modifications=modifications, ffc=ffc
+        )
+        return PatriciaTree(root=updated_root, height=self.height)
+
     async def get_diff_between_patricia_trees(
         self,
         other: "PatriciaTree",
@@ -98,3 +123,52 @@ class PatriciaTree(BinaryFactTree):
             for hash_value in (self.root, other.root)
         ]
         return await self_node.get_diff_between_trees(other=other_node, ffc=ffc, fact_cls=fact_cls)
+
+    async def fetch_witnesses(
+        self,
+        ffc: FactFetchingContext,
+        sorted_leaf_indices: List[int],
+        fact_cls: Optional[Type[TLeafFact]],
+        empty_leaf: TLeafFact,
+    ) -> Dict[int, TLeafFact]:
+        """
+        Fetches the necessary witnesses from storage to update the tree at the provided leaf
+        indices. This function is meant to be called with an underlying CachedStorage, filling the
+        cache with the witnesses. If fact_cls is given, the witnesses include the leaves
+        (modified and siblings) and this function returns the previous leaves at the given indices.
+        Otherwise, empty leaves are returned.
+        """
+        assert empty_leaf.is_empty
+        leaves = {index: empty_leaf for index in sorted_leaf_indices}
+
+        if self.root == EmptyNodeFact.EMPTY_NODE_HASH:
+            # Nothing to fetch and all leaves are empty.
+            return leaves
+
+        leaf_layer_prefix = 1 << self.height
+        sorted_leaf_full_indices = [leaf_layer_prefix | index for index in sorted_leaf_indices]
+        tree_context = TreeContext.create(
+            height=self.height, leaves=defaultdict(lambda: b""), ffc=ffc
+        )
+
+        await fetch_nodes(
+            subtrees=[SubTree(index=1, root_hash=self.root, leaf_indices=sorted_leaf_full_indices)],
+            context=tree_context,
+            leaf_fact_cls=fact_cls,
+        )
+        # Get the facts of the modified leaves.
+        modified_leaves_facts = await ffc.storage.mget_or_fail(
+            list(tree_context.modified_leaves_to_db_keys.values())
+        )
+
+        # Override non-empty leaves.
+        if fact_cls is not None:
+            leaves.update(
+                {
+                    leaf_index ^ leaf_layer_prefix: fact_cls.deserialize(leaf_fact)
+                    for leaf_index, leaf_fact in safe_zip(
+                        tree_context.modified_leaves_to_db_keys.keys(), modified_leaves_facts
+                    )
+                }
+            )
+        return leaves

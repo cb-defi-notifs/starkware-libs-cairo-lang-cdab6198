@@ -4,6 +4,27 @@ from starkware.cairo.common.builtin_keccak.keccak import (
     keccak_padded_input,
 )
 from starkware.cairo.common.cairo_builtins import BitwiseBuiltin, KeccakBuiltin
+from starkware.cairo.common.cairo_secp.bigint import (
+    bigint_to_uint256,
+    nondet_bigint3,
+    uint256_to_bigint,
+)
+from starkware.cairo.common.cairo_secp.bigint3 import BigInt3, UnreducedBigInt3
+from starkware.cairo.common.cairo_secp.constants import SECP_PRIME_HIGH as SECP256K1_PRIME_HIGH
+from starkware.cairo.common.cairo_secp.constants import SECP_PRIME_LOW as SECP256K1_PRIME_LOW
+from starkware.cairo.common.cairo_secp.ec import ec_add as secp256k1_ec_add
+from starkware.cairo.common.cairo_secp.ec import ec_mul_by_uint256 as secp256k1_ec_mul_by_uint256
+from starkware.cairo.common.cairo_secp.ec_point import EcPoint as SecpPoint
+from starkware.cairo.common.cairo_secp.field import (
+    reduce,
+    unreduced_mul,
+    unreduced_sqr,
+    validate_reduced_field_element,
+    verify_zero,
+)
+from starkware.cairo.common.cairo_secp.signature import (
+    try_get_point_from_x as secp256k1_try_get_point_from_x,
+)
 from starkware.cairo.common.dict import dict_read, dict_update
 from starkware.cairo.common.dict_access import DictAccess
 from starkware.cairo.common.math import (
@@ -14,7 +35,16 @@ from starkware.cairo.common.math import (
     unsigned_div_rem,
 )
 from starkware.cairo.common.memcpy import memcpy
+from starkware.cairo.common.secp256r1.constants import SECP_PRIME_HIGH as SECP256R1_PRIME_HIGH
+from starkware.cairo.common.secp256r1.constants import SECP_PRIME_LOW as SECP256R1_PRIME_LOW
+from starkware.cairo.common.secp256r1.ec import ec_add as secp256r1_ec_add
+from starkware.cairo.common.secp256r1.ec import ec_mul_by_uint256 as secp256r1_ec_mul_by_uint256
+from starkware.cairo.common.secp256r1.ec import (
+    try_get_point_from_x as secp256r1_try_get_point_from_x,
+)
 from starkware.cairo.common.segments import relocate_segment
+from starkware.cairo.common.sha256_state import Sha256Input, Sha256ProcessBlock, Sha256State
+from starkware.cairo.common.uint256 import Uint256, assert_uint256_lt, uint256_lt
 from starkware.starknet.common.new_syscalls import (
     CALL_CONTRACT_SELECTOR,
     DEPLOY_SELECTOR,
@@ -24,7 +54,18 @@ from starkware.starknet.common.new_syscalls import (
     KECCAK_SELECTOR,
     LIBRARY_CALL_SELECTOR,
     REPLACE_CLASS_SELECTOR,
+    SECP256K1_ADD_SELECTOR,
+    SECP256K1_GET_POINT_FROM_X_SELECTOR,
+    SECP256K1_GET_XY_SELECTOR,
+    SECP256K1_MUL_SELECTOR,
+    SECP256K1_NEW_SELECTOR,
+    SECP256R1_ADD_SELECTOR,
+    SECP256R1_GET_POINT_FROM_X_SELECTOR,
+    SECP256R1_GET_XY_SELECTOR,
+    SECP256R1_MUL_SELECTOR,
+    SECP256R1_NEW_SELECTOR,
     SEND_MESSAGE_TO_L1_SELECTOR,
+    SHA256_PROCESS_BLOCK_SELECTOR,
     STORAGE_READ_SELECTOR,
     STORAGE_WRITE_SELECTOR,
     CallContractRequest,
@@ -43,7 +84,25 @@ from starkware.starknet.common.new_syscalls import (
     ReplaceClassRequest,
     RequestHeader,
     ResponseHeader,
+    Secp256k1AddRequest,
+    Secp256k1AddResponse,
+    Secp256k1GetPointFromXRequest,
+    Secp256k1MulRequest,
+    Secp256k1MulResponse,
+    Secp256k1NewRequest,
+    Secp256k1NewResponse,
+    Secp256r1AddRequest,
+    Secp256r1AddResponse,
+    Secp256r1GetPointFromXRequest,
+    Secp256r1MulRequest,
+    Secp256r1MulResponse,
+    Secp256r1NewRequest,
+    Secp256r1NewResponse,
+    SecpGetXyRequest,
+    SecpGetXyResponse,
     SendMessageToL1Request,
+    Sha256ProcessBlockRequest,
+    Sha256ProcessBlockResponse,
     StorageReadRequest,
     StorageReadResponse,
     StorageWriteRequest,
@@ -63,6 +122,7 @@ from starkware.starknet.core.os.constants import (
     ENTRY_POINT_TYPE_CONSTRUCTOR,
     ENTRY_POINT_TYPE_EXTERNAL,
     ERROR_BLOCK_NUMBER_OUT_OF_RANGE,
+    ERROR_INVALID_ARGUMENT,
     ERROR_INVALID_INPUT_LEN,
     ERROR_OUT_OF_GAS,
     GET_BLOCK_HASH_GAS_COST,
@@ -71,7 +131,18 @@ from starkware.starknet.core.os.constants import (
     KECCAK_ROUND_COST_GAS_COST,
     LIBRARY_CALL_GAS_COST,
     REPLACE_CLASS_GAS_COST,
+    SECP256K1_ADD_GAS_COST,
+    SECP256K1_GET_POINT_FROM_X_GAS_COST,
+    SECP256K1_GET_XY_GAS_COST,
+    SECP256K1_MUL_GAS_COST,
+    SECP256K1_NEW_GAS_COST,
+    SECP256R1_ADD_GAS_COST,
+    SECP256R1_GET_POINT_FROM_X_GAS_COST,
+    SECP256R1_GET_XY_GAS_COST,
+    SECP256R1_MUL_GAS_COST,
+    SECP256R1_NEW_GAS_COST,
     SEND_MESSAGE_TO_L1_GAS_COST,
+    SHA256_PROCESS_BLOCK_GAS_COST,
     STORAGE_READ_GAS_COST,
     STORAGE_WRITE_GAS_COST,
     STORED_BLOCK_HASH_BUFFER,
@@ -88,7 +159,7 @@ from starkware.starknet.core.os.output import (
     OsCarriedOutputs,
     os_carried_outputs_new,
 )
-from starkware.starknet.core.os.state import StateEntry
+from starkware.starknet.core.os.state.commitment import StateEntry
 
 // Executes the system calls in syscall_ptr.
 // The signature of the function 'call_execute_syscalls' must match this function's signature.
@@ -110,8 +181,27 @@ func execute_syscalls{
     }
 
     tempvar selector = [syscall_ptr];
+    %{
+        execution_helper.os_logger.enter_syscall(
+            n_steps=current_step,
+            builtin_ptrs=ids.builtin_ptrs,
+            range_check_ptr=ids.range_check_ptr,
+            deprecated=False,
+            selector=ids.selector,
+        )
+
+        # Prepare a short callable to save code duplication.
+        exit_syscall = lambda selector: execution_helper.os_logger.exit_syscall(
+            n_steps=current_step,
+            builtin_ptrs=ids.builtin_ptrs,
+            range_check_ptr=ids.range_check_ptr,
+            selector=selector,
+        )
+    %}
+
     if (selector == STORAGE_READ_SELECTOR) {
         execute_storage_read(contract_address=execution_context.execution_info.contract_address);
+        %{ exit_syscall(selector=ids.STORAGE_READ_SELECTOR) %}
         return execute_syscalls(
             block_context=block_context,
             execution_context=execution_context,
@@ -121,6 +211,7 @@ func execute_syscalls{
 
     if (selector == STORAGE_WRITE_SELECTOR) {
         execute_storage_write(contract_address=execution_context.execution_info.contract_address);
+        %{ exit_syscall(selector=ids.STORAGE_WRITE_SELECTOR) %}
         return execute_syscalls(
             block_context=block_context,
             execution_context=execution_context,
@@ -130,6 +221,7 @@ func execute_syscalls{
 
     if (selector == GET_EXECUTION_INFO_SELECTOR) {
         execute_get_execution_info(execution_info=execution_context.execution_info);
+        %{ exit_syscall(selector=ids.GET_EXECUTION_INFO_SELECTOR) %}
         return execute_syscalls(
             block_context=block_context,
             execution_context=execution_context,
@@ -141,6 +233,7 @@ func execute_syscalls{
         execute_call_contract(
             block_context=block_context, caller_execution_context=execution_context
         );
+        %{ exit_syscall(selector=ids.CALL_CONTRACT_SELECTOR) %}
         return execute_syscalls(
             block_context=block_context,
             execution_context=execution_context,
@@ -152,6 +245,7 @@ func execute_syscalls{
         execute_library_call(
             block_context=block_context, caller_execution_context=execution_context
         );
+        %{ exit_syscall(selector=ids.LIBRARY_CALL_SELECTOR) %}
         return execute_syscalls(
             block_context=block_context,
             execution_context=execution_context,
@@ -164,6 +258,7 @@ func execute_syscalls{
         reduce_syscall_gas_and_write_response_header(
             total_gas_cost=EMIT_EVENT_GAS_COST, request_struct_size=EmitEventRequest.SIZE
         );
+        %{ exit_syscall(selector=ids.EMIT_EVENT_SELECTOR) %}
         return execute_syscalls(
             block_context=block_context,
             execution_context=execution_context,
@@ -173,6 +268,7 @@ func execute_syscalls{
 
     if (selector == DEPLOY_SELECTOR) {
         execute_deploy(block_context=block_context, caller_execution_context=execution_context);
+        %{ exit_syscall(selector=ids.DEPLOY_SELECTOR) %}
         return execute_syscalls(
             block_context=block_context,
             execution_context=execution_context,
@@ -182,6 +278,7 @@ func execute_syscalls{
 
     if (selector == GET_BLOCK_HASH_SELECTOR) {
         execute_get_block_hash(block_context=block_context);
+        %{ exit_syscall(selector=ids.GET_BLOCK_HASH_SELECTOR) %}
         return execute_syscalls(
             block_context=block_context,
             execution_context=execution_context,
@@ -191,6 +288,7 @@ func execute_syscalls{
 
     if (selector == REPLACE_CLASS_SELECTOR) {
         execute_replace_class(contract_address=execution_context.execution_info.contract_address);
+        %{ exit_syscall(selector=ids.REPLACE_CLASS_SELECTOR) %}
         return execute_syscalls(
             block_context=block_context,
             execution_context=execution_context,
@@ -200,6 +298,123 @@ func execute_syscalls{
 
     if (selector == KECCAK_SELECTOR) {
         execute_keccak();
+        %{ exit_syscall(selector=ids.KECCAK_SELECTOR) %}
+        return execute_syscalls(
+            block_context=block_context,
+            execution_context=execution_context,
+            syscall_ptr_end=syscall_ptr_end,
+        );
+    }
+
+    if (selector == SHA256_PROCESS_BLOCK_SELECTOR) {
+        execute_sha256_process_block();
+        %{ exit_syscall(selector=ids.SHA256_PROCESS_BLOCK_SELECTOR) %}
+        return execute_syscalls(
+            block_context=block_context,
+            execution_context=execution_context,
+            syscall_ptr_end=syscall_ptr_end,
+        );
+    }
+
+    if (selector == SECP256K1_GET_POINT_FROM_X_SELECTOR) {
+        execute_secp256k1_get_point_from_x();
+        %{ exit_syscall(selector=ids.SECP256K1_GET_POINT_FROM_X_SELECTOR) %}
+        return execute_syscalls(
+            block_context=block_context,
+            execution_context=execution_context,
+            syscall_ptr_end=syscall_ptr_end,
+        );
+    }
+
+    if (selector == SECP256R1_GET_POINT_FROM_X_SELECTOR) {
+        execute_secp256r1_get_point_from_x();
+        %{ exit_syscall(selector=ids.SECP256R1_GET_POINT_FROM_X_SELECTOR) %}
+        return execute_syscalls(
+            block_context=block_context,
+            execution_context=execution_context,
+            syscall_ptr_end=syscall_ptr_end,
+        );
+    }
+
+    if (selector == SECP256K1_NEW_SELECTOR) {
+        execute_secp256k1_new();
+        %{ exit_syscall(selector=ids.SECP256K1_NEW_SELECTOR) %}
+        return execute_syscalls(
+            block_context=block_context,
+            execution_context=execution_context,
+            syscall_ptr_end=syscall_ptr_end,
+        );
+    }
+
+    if (selector == SECP256R1_NEW_SELECTOR) {
+        execute_secp256r1_new();
+        %{ exit_syscall(selector=ids.SECP256R1_NEW_SELECTOR) %}
+        return execute_syscalls(
+            block_context=block_context,
+            execution_context=execution_context,
+            syscall_ptr_end=syscall_ptr_end,
+        );
+    }
+
+    if (selector == SECP256K1_ADD_SELECTOR) {
+        execute_secp256k1_add();
+        %{ exit_syscall(selector=ids.SECP256K1_ADD_SELECTOR) %}
+        return execute_syscalls(
+            block_context=block_context,
+            execution_context=execution_context,
+            syscall_ptr_end=syscall_ptr_end,
+        );
+    }
+
+    if (selector == SECP256R1_ADD_SELECTOR) {
+        execute_secp256r1_add();
+        %{ exit_syscall(selector=ids.SECP256R1_ADD_SELECTOR) %}
+        return execute_syscalls(
+            block_context=block_context,
+            execution_context=execution_context,
+            syscall_ptr_end=syscall_ptr_end,
+        );
+    }
+
+    if (selector == SECP256K1_MUL_SELECTOR) {
+        execute_secp256k1_mul();
+        %{ exit_syscall(selector=ids.SECP256K1_MUL_SELECTOR) %}
+        return execute_syscalls(
+            block_context=block_context,
+            execution_context=execution_context,
+            syscall_ptr_end=syscall_ptr_end,
+        );
+    }
+
+    if (selector == SECP256R1_MUL_SELECTOR) {
+        execute_secp256r1_mul();
+        %{ exit_syscall(selector=ids.SECP256R1_MUL_SELECTOR) %}
+        return execute_syscalls(
+            block_context=block_context,
+            execution_context=execution_context,
+            syscall_ptr_end=syscall_ptr_end,
+        );
+    }
+
+    if (selector == SECP256K1_GET_XY_SELECTOR) {
+        execute_secp_get_xy(
+            curve_prime=Uint256(low=SECP256K1_PRIME_LOW, high=SECP256K1_PRIME_HIGH),
+            gas_cost=SECP256K1_GET_XY_GAS_COST,
+        );
+        %{ exit_syscall(selector=ids.SECP256K1_GET_XY_SELECTOR) %}
+        return execute_syscalls(
+            block_context=block_context,
+            execution_context=execution_context,
+            syscall_ptr_end=syscall_ptr_end,
+        );
+    }
+
+    if (selector == SECP256R1_GET_XY_SELECTOR) {
+        execute_secp_get_xy(
+            curve_prime=Uint256(low=SECP256R1_PRIME_LOW, high=SECP256R1_PRIME_HIGH),
+            gas_cost=SECP256R1_GET_XY_GAS_COST,
+        );
+        %{ exit_syscall(selector=ids.SECP256R1_GET_XY_SELECTOR) %}
         return execute_syscalls(
             block_context=block_context,
             execution_context=execution_context,
@@ -210,6 +425,7 @@ func execute_syscalls{
     assert selector = SEND_MESSAGE_TO_L1_SELECTOR;
 
     execute_send_message_to_l1(contract_address=execution_context.execution_info.contract_address);
+    %{ exit_syscall(selector=ids.SEND_MESSAGE_TO_L1_SELECTOR) %}
     return execute_syscalls(
         block_context=block_context,
         execution_context=execution_context,
@@ -319,7 +535,7 @@ func contract_call_helper{
     outputs: OsCarriedOutputs*,
 }(remaining_gas: felt, block_context: BlockContext*, execution_context: ExecutionContext*) {
     with remaining_gas {
-        let (retdata_size, retdata) = select_execute_entry_point_func(
+        let (retdata_size, retdata, _is_deprecated) = select_execute_entry_point_func(
             block_context=block_context, execution_context=execution_context
         );
     }
@@ -329,7 +545,9 @@ func contract_call_helper{
     let syscall_ptr = syscall_ptr + ResponseHeader.SIZE;
 
     // Write the response header.
-    assert [response_header] = ResponseHeader(gas=remaining_gas, failure_flag=0);
+    with_attr error_message("Predicted gas costs are inconsistent with the actual execution.") {
+        assert [response_header] = ResponseHeader(gas=remaining_gas, failure_flag=0);
+    }
 
     let response = cast(syscall_ptr, CallContractResponse*);
     // Advance syscall pointer to the next syscall.
@@ -406,6 +624,9 @@ func execute_deploy{
             ec_op=selectable_builtins.ec_op,
             poseidon=selectable_builtins.poseidon,
             segment_arena=selectable_builtins.segment_arena,
+            range_check96=selectable_builtins.range_check96,
+            add_mod=selectable_builtins.add_mod,
+            mul_mod=selectable_builtins.mul_mod,
         ),
         non_selectable=builtin_ptrs.non_selectable,
     );
@@ -588,7 +809,7 @@ func execute_get_block_hash{
 
     // Handle out of range block number.
     let request_block_number = request.block_number;
-    let current_block_number = block_context.block_info.block_number;
+    let current_block_number = block_context.block_info_for_execute.block_number;
 
     // A block number is a u64. STORED_BLOCK_HASH_BUFFER is 10.
     // The following computations will not overflow.
@@ -740,8 +961,9 @@ func execute_keccak{
     }
 
     let selectable_builtins = &builtin_ptrs.selectable;
+    let non_selectable_builtins = &builtin_ptrs.non_selectable;
     let bitwise_ptr = selectable_builtins.bitwise;
-    let keccak_ptr = builtin_ptrs.non_selectable.keccak;
+    let keccak_ptr = non_selectable_builtins.keccak;
     with bitwise_ptr, keccak_ptr {
         let (res) = keccak_padded_input(inputs=input_start, n_blocks=q);
     }
@@ -760,9 +982,382 @@ func execute_keccak{
             ec_op=selectable_builtins.ec_op,
             poseidon=selectable_builtins.poseidon,
             segment_arena=selectable_builtins.segment_arena,
+            range_check96=selectable_builtins.range_check96,
+            add_mod=selectable_builtins.add_mod,
+            mul_mod=selectable_builtins.mul_mod,
         ),
-        non_selectable=NonSelectableBuiltins(keccak=keccak_ptr),
+        non_selectable=NonSelectableBuiltins(
+            keccak=keccak_ptr, sha256=non_selectable_builtins.sha256
+        ),
     );
+    return ();
+}
+
+// Executes the sha256_process_block system call.
+func execute_sha256_process_block{
+    range_check_ptr, builtin_ptrs: BuiltinPointers*, syscall_ptr: felt*, outputs: OsCarriedOutputs*
+}() {
+    alloc_locals;
+
+    let request = cast(syscall_ptr + RequestHeader.SIZE, Sha256ProcessBlockRequest*);
+
+    // Reduce gas.
+    let (success, remaining_gas) = reduce_syscall_base_gas(
+        specific_base_gas_cost=SHA256_PROCESS_BLOCK_GAS_COST,
+        request_struct_size=Sha256ProcessBlockRequest.SIZE,
+    );
+
+    if (success == 0) {
+        // Not enough gas to execute the syscall.
+        return ();
+    }
+
+    // Gas reduction has succeeded and the request is valid; write the response header.
+    let response_header = cast(syscall_ptr, ResponseHeader*);
+    // Advance syscall pointer to the response body.
+    let syscall_ptr = syscall_ptr + ResponseHeader.SIZE;
+    assert [response_header] = ResponseHeader(gas=remaining_gas, failure_flag=0);
+
+    local sha256_ptr: Sha256ProcessBlock* = builtin_ptrs.non_selectable.sha256;
+
+    let input: Sha256Input* = &sha256_ptr.input;
+    assert [input] = [request.input_start];
+
+    let state: Sha256State* = &sha256_ptr.in_state;
+    assert [state] = [request.state_ptr];
+
+    let res: Sha256State* = &sha256_ptr.out_state;
+    let sha256_ptr = &sha256_ptr[1];
+
+    assert [cast(syscall_ptr, Sha256ProcessBlockResponse*)] = Sha256ProcessBlockResponse(
+        state_ptr=res
+    );
+    let syscall_ptr = syscall_ptr + Sha256ProcessBlockResponse.SIZE;
+
+    tempvar builtin_ptrs = new BuiltinPointers(
+        selectable=builtin_ptrs.selectable,
+        non_selectable=NonSelectableBuiltins(
+            keccak=builtin_ptrs.non_selectable.keccak, sha256=sha256_ptr
+        ),
+    );
+    return ();
+}
+
+// Executes the secp256k1_add system call.
+func execute_secp256k1_add{range_check_ptr, syscall_ptr: felt*}() {
+    alloc_locals;
+    let request = cast(syscall_ptr + RequestHeader.SIZE, Secp256k1AddRequest*);
+
+    // Reduce gas.
+    let success = reduce_syscall_gas_and_write_response_header(
+        total_gas_cost=SECP256K1_ADD_GAS_COST, request_struct_size=Secp256k1AddRequest.SIZE
+    );
+    if (success == 0) {
+        // Not enough gas to execute the syscall.
+        return ();
+    }
+
+    let (res) = secp256k1_ec_add(point0=[request.p0], point1=[request.p1]);
+    let response = cast(syscall_ptr, Secp256k1AddResponse*);
+    static_assert Secp256k1AddResponse.SIZE == 1;
+    assert [response.ec_point] = res;
+    let syscall_ptr = syscall_ptr + Secp256k1AddResponse.SIZE;
+    return ();
+}
+
+// Executes the secp256r1_add system call.
+func execute_secp256r1_add{range_check_ptr, syscall_ptr: felt*}() {
+    alloc_locals;
+    let request = cast(syscall_ptr + RequestHeader.SIZE, Secp256r1AddRequest*);
+
+    // Reduce gas.
+    let success = reduce_syscall_gas_and_write_response_header(
+        total_gas_cost=SECP256R1_ADD_GAS_COST, request_struct_size=Secp256r1AddRequest.SIZE
+    );
+    if (success == 0) {
+        // Not enough gas to execute the syscall.
+        return ();
+    }
+
+    let (res) = secp256r1_ec_add(point0=[request.p0], point1=[request.p1]);
+    let response = cast(syscall_ptr, Secp256r1AddResponse*);
+    static_assert Secp256r1AddResponse.SIZE == 1;
+    assert [response.ec_point] = res;
+    let syscall_ptr = syscall_ptr + Secp256r1AddResponse.SIZE;
+    return ();
+}
+
+// Executes the secp256k1_mul system call.
+func execute_secp256k1_mul{range_check_ptr, syscall_ptr: felt*}() {
+    alloc_locals;
+    let request = cast(syscall_ptr + RequestHeader.SIZE, Secp256k1MulRequest*);
+
+    // Reduce gas.
+    let success = reduce_syscall_gas_and_write_response_header(
+        total_gas_cost=SECP256K1_MUL_GAS_COST, request_struct_size=Secp256k1MulRequest.SIZE
+    );
+    if (success == 0) {
+        // Not enough gas to execute the syscall.
+        return ();
+    }
+
+    let (res) = secp256k1_ec_mul_by_uint256(point=[request.p], scalar=request.scalar);
+    let response = cast(syscall_ptr, Secp256k1MulResponse*);
+    static_assert Secp256k1MulResponse.SIZE == 1;
+    assert [response.ec_point] = res;
+    let syscall_ptr = syscall_ptr + Secp256k1MulResponse.SIZE;
+
+    return ();
+}
+
+// Executes the secp256r1_mul system call.
+func execute_secp256r1_mul{range_check_ptr, syscall_ptr: felt*}() {
+    alloc_locals;
+    let request = cast(syscall_ptr + RequestHeader.SIZE, Secp256r1MulRequest*);
+
+    // Reduce gas.
+    let success = reduce_syscall_gas_and_write_response_header(
+        total_gas_cost=SECP256R1_MUL_GAS_COST, request_struct_size=Secp256r1MulRequest.SIZE
+    );
+    if (success == 0) {
+        // Not enough gas to execute the syscall.
+        return ();
+    }
+
+    let (res) = secp256r1_ec_mul_by_uint256(point=[request.p], scalar=request.scalar);
+    let response = cast(syscall_ptr, Secp256r1MulResponse*);
+    static_assert Secp256r1MulResponse.SIZE == 1;
+    assert [response.ec_point] = res;
+    let syscall_ptr = syscall_ptr + Secp256r1MulResponse.SIZE;
+
+    return ();
+}
+
+// Executes the secp256k1_new system call.
+func execute_secp256k1_new{range_check_ptr, syscall_ptr: felt*}() {
+    alloc_locals;
+    let request = cast(syscall_ptr + RequestHeader.SIZE, Secp256k1NewRequest*);
+
+    let (success, remaining_gas) = reduce_syscall_base_gas(
+        specific_base_gas_cost=SECP256K1_NEW_GAS_COST, request_struct_size=Secp256k1NewRequest.SIZE
+    );
+    if (success == 0) {
+        // Not enough gas to execute the syscall.
+        return ();
+    }
+
+    let secp_prime = Uint256(low=SECP256K1_PRIME_LOW, high=SECP256K1_PRIME_HIGH);
+    let (is_x_valid) = uint256_lt(request.x, secp_prime);
+    let (is_y_valid) = uint256_lt(request.y, secp_prime);
+
+    if ((is_x_valid + is_y_valid) != 2) {
+        write_failure_response(remaining_gas=remaining_gas, failure_felt=ERROR_INVALID_ARGUMENT);
+        return ();
+    }
+
+    let response_header = cast(syscall_ptr, ResponseHeader*);
+    assert [response_header] = ResponseHeader(gas=remaining_gas, failure_flag=0);
+    let syscall_ptr = syscall_ptr + ResponseHeader.SIZE;
+
+    let response = cast(syscall_ptr, Secp256k1NewResponse*);
+    let syscall_ptr = syscall_ptr + Secp256k1NewResponse.SIZE;
+    if (request.x.low == 0 and request.x.high == 0 and request.y.low == 0 and request.y.high == 0) {
+        // Return the point at infinity.
+        assert response.not_on_curve = 0;
+        assert [response.ec_point] = SecpPoint(x=BigInt3(0, 0, 0), y=BigInt3(0, 0, 0));
+        return ();
+    }
+
+    let (x) = uint256_to_bigint(request.x);
+
+    let not_on_curve = response.not_on_curve;
+    tempvar result_ptr = cast(
+        nondet %{ ids.response.ec_point.address_ if ids.not_on_curve == 0 else segments.add() %},
+        SecpPoint*,
+    );
+
+    // Note that there are no constraints on response.ec_point in the failure case.
+
+    let (is_on_curve) = secp256k1_try_get_point_from_x(x=x, v=request.y.low, result=result_ptr);
+    if (is_on_curve == 0) {
+        // Return early to avoid dealing with range_check_ptr divergence.
+        assert response.not_on_curve = 1;
+        return ();
+    }
+
+    let (point_y) = bigint_to_uint256(result_ptr.y);
+    if (point_y.low == request.y.low and point_y.high == request.y.high) {
+        assert [response] = Secp256k1NewResponse(not_on_curve=0, ec_point=result_ptr);
+        return ();
+    }
+    assert response.not_on_curve = 1;
+    return ();
+}
+
+// Executes the secp256r1_new system call.
+func execute_secp256r1_new{range_check_ptr, syscall_ptr: felt*}() {
+    alloc_locals;
+    let request = cast(syscall_ptr + RequestHeader.SIZE, Secp256r1NewRequest*);
+
+    let (success, remaining_gas) = reduce_syscall_base_gas(
+        specific_base_gas_cost=SECP256R1_NEW_GAS_COST, request_struct_size=Secp256r1NewRequest.SIZE
+    );
+    if (success == 0) {
+        // Not enough gas to execute the syscall.
+        return ();
+    }
+
+    let secp_prime = Uint256(low=SECP256R1_PRIME_LOW, high=SECP256R1_PRIME_HIGH);
+    let (is_x_valid) = uint256_lt(request.x, secp_prime);
+    let (is_y_valid) = uint256_lt(request.y, secp_prime);
+
+    if ((is_x_valid + is_y_valid) != 2) {
+        write_failure_response(remaining_gas=remaining_gas, failure_felt=ERROR_INVALID_ARGUMENT);
+        return ();
+    }
+
+    let response_header = cast(syscall_ptr, ResponseHeader*);
+    assert [response_header] = ResponseHeader(gas=remaining_gas, failure_flag=0);
+    let syscall_ptr = syscall_ptr + ResponseHeader.SIZE;
+
+    let response = cast(syscall_ptr, Secp256r1NewResponse*);
+    let syscall_ptr = syscall_ptr + Secp256r1NewResponse.SIZE;
+    if (request.x.low == 0 and request.x.high == 0 and request.y.low == 0 and request.y.high == 0) {
+        // Return the point at infinity.
+        assert response.not_on_curve = 0;
+        assert [response.ec_point] = SecpPoint(x=BigInt3(0, 0, 0), y=BigInt3(0, 0, 0));
+        return ();
+    }
+
+    let (x) = uint256_to_bigint(request.x);
+
+    let not_on_curve = response.not_on_curve;
+    tempvar result_ptr = cast(
+        nondet %{ ids.response.ec_point.address_ if ids.not_on_curve == 0 else segments.add() %},
+        SecpPoint*,
+    );
+
+    // Note that there are no constraints on response.ec_point in the failure case.
+
+    let (is_on_curve) = secp256r1_try_get_point_from_x(x=x, v=request.y.low, result=result_ptr);
+    if (is_on_curve == 0) {
+        // Return early to avoid dealing with range_check_ptr divergence.
+        assert response.not_on_curve = 1;
+        return ();
+    }
+
+    let (point_y) = bigint_to_uint256(result_ptr.y);
+    if (point_y.low == request.y.low and point_y.high == request.y.high) {
+        assert [response] = Secp256r1NewResponse(not_on_curve=0, ec_point=result_ptr);
+        return ();
+    }
+    assert response.not_on_curve = 1;
+    return ();
+}
+
+// Executes the secp256k1_get_point_from_x system call.
+func execute_secp256k1_get_point_from_x{range_check_ptr, syscall_ptr: felt*}() {
+    alloc_locals;
+    let request = cast(syscall_ptr + RequestHeader.SIZE, Secp256k1GetPointFromXRequest*);
+    let (success, remaining_gas) = reduce_syscall_base_gas(
+        specific_base_gas_cost=SECP256K1_GET_POINT_FROM_X_GAS_COST,
+        request_struct_size=Secp256k1GetPointFromXRequest.SIZE,
+    );
+    if (success == 0) {
+        // Not enough gas to execute the syscall.
+        return ();
+    }
+
+    let secp_prime = Uint256(low=SECP256K1_PRIME_LOW, high=SECP256K1_PRIME_HIGH);
+    let (is_x_valid) = uint256_lt(request.x, secp_prime);
+
+    if (is_x_valid == 0) {
+        write_failure_response(remaining_gas=remaining_gas, failure_felt=ERROR_INVALID_ARGUMENT);
+        return ();
+    }
+
+    let response_header = cast(syscall_ptr, ResponseHeader*);
+    assert [response_header] = ResponseHeader(gas=remaining_gas, failure_flag=0);
+    let syscall_ptr = syscall_ptr + ResponseHeader.SIZE;
+
+    let response = cast(syscall_ptr, Secp256k1NewResponse*);
+    let syscall_ptr = syscall_ptr + Secp256k1NewResponse.SIZE;
+
+    let (x) = uint256_to_bigint(request.x);
+    // Note that there are no constraints on response.ec_point in the failure case.
+    let (is_on_curve) = secp256k1_try_get_point_from_x(
+        x=x, v=request.y_parity, result=response.ec_point
+    );
+    assert response.not_on_curve = 1 - is_on_curve;
+
+    return ();
+}
+
+// Executes the secp256r1_get_point_from_x system call.
+func execute_secp256r1_get_point_from_x{range_check_ptr, syscall_ptr: felt*}() {
+    alloc_locals;
+    let request = cast(syscall_ptr + RequestHeader.SIZE, Secp256r1GetPointFromXRequest*);
+    let (success, remaining_gas) = reduce_syscall_base_gas(
+        specific_base_gas_cost=SECP256R1_GET_POINT_FROM_X_GAS_COST,
+        request_struct_size=Secp256r1GetPointFromXRequest.SIZE,
+    );
+    if (success == 0) {
+        // Not enough gas to execute the syscall.
+        return ();
+    }
+
+    let secp_prime = Uint256(low=SECP256R1_PRIME_LOW, high=SECP256R1_PRIME_HIGH);
+    let (is_x_valid) = uint256_lt(request.x, secp_prime);
+
+    if (is_x_valid == 0) {
+        write_failure_response(remaining_gas=remaining_gas, failure_felt=ERROR_INVALID_ARGUMENT);
+        return ();
+    }
+
+    let response_header = cast(syscall_ptr, ResponseHeader*);
+    assert [response_header] = ResponseHeader(gas=remaining_gas, failure_flag=0);
+    let syscall_ptr = syscall_ptr + ResponseHeader.SIZE;
+
+    let response = cast(syscall_ptr, Secp256r1NewResponse*);
+    let syscall_ptr = syscall_ptr + Secp256r1NewResponse.SIZE;
+
+    let (x) = uint256_to_bigint(request.x);
+    // Note that there are no constraints on response.ec_point in the failure case.
+    let (is_on_curve) = secp256r1_try_get_point_from_x(
+        x=x, v=request.y_parity, result=response.ec_point
+    );
+    assert response.not_on_curve = 1 - is_on_curve;
+
+    return ();
+}
+
+// Executes the secp256k1_get_xy system call.
+// Takes the curve prime and the gas cost of the syscall as arguments.
+func execute_secp_get_xy{range_check_ptr, syscall_ptr: felt*}(
+    curve_prime: Uint256, gas_cost: felt
+) {
+    alloc_locals;
+    let request = cast(syscall_ptr + RequestHeader.SIZE, SecpGetXyRequest*);
+
+    // Reduce gas.
+    let success = reduce_syscall_gas_and_write_response_header(
+        total_gas_cost=gas_cost, request_struct_size=SecpGetXyRequest.SIZE
+    );
+    if (success == 0) {
+        // Not enough gas to execute the syscall.
+        return ();
+    }
+
+    tempvar ec_point = request.ec_point;
+    let (x) = bigint_to_uint256(ec_point.x);
+    let (y) = bigint_to_uint256(ec_point.y);
+
+    assert_uint256_lt(x, curve_prime);
+    assert_uint256_lt(y, curve_prime);
+
+    assert [cast(syscall_ptr, SecpGetXyResponse*)] = SecpGetXyResponse(x=x, y=y);
+
+    let syscall_ptr = syscall_ptr + SecpGetXyResponse.SIZE;
     return ();
 }
 

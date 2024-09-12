@@ -17,6 +17,10 @@ from starkware.cairo.lang.builtins.bitwise.bitwise_builtin_runner import Bitwise
 from starkware.cairo.lang.builtins.ec.ec_op_builtin_runner import EcOpBuiltinRunner
 from starkware.cairo.lang.builtins.hash.hash_builtin_runner import HashBuiltinRunner
 from starkware.cairo.lang.builtins.keccak.keccak_builtin_runner import KeccakBuiltinRunner
+from starkware.cairo.lang.builtins.modulo.mod_builtin_runner import (
+    AddModBuiltinRunner,
+    MulModBuiltinRunner,
+)
 from starkware.cairo.lang.builtins.poseidon.poseidon_builtin_runner import PoseidonBuiltinRunner
 from starkware.cairo.lang.builtins.range_check.range_check_builtin_runner import (
     RangeCheckBuiltinRunner,
@@ -32,7 +36,7 @@ from starkware.cairo.lang.compiler.expression_simplifier import to_field_element
 from starkware.cairo.lang.compiler.preprocessor.default_pass_manager import default_pass_manager
 from starkware.cairo.lang.compiler.preprocessor.preprocessor import Preprocessor
 from starkware.cairo.lang.compiler.program import Program, ProgramBase
-from starkware.cairo.lang.instances import DYNAMIC_LAYOUT_NAME, LAYOUTS, CairoLayout
+from starkware.cairo.lang.instances import LAYOUTS, CairoLayout
 from starkware.cairo.lang.vm.builtin_runner import BuiltinRunner, InsufficientAllocatedCells
 from starkware.cairo.lang.vm.cairo_pie import (
     CairoPie,
@@ -87,6 +91,7 @@ class CairoRunner:
         memory: MemoryDict = None,
         proof_mode: Optional[bool] = None,
         allow_missing_builtins: Optional[bool] = None,
+        enable_instruction_trace: bool = True,
         additional_builtin_factories: Optional[
             Dict[str, Callable[[str, bool], BuiltinRunner]]
         ] = None,
@@ -102,6 +107,12 @@ class CairoRunner:
         self.allow_missing_builtins = (
             False if allow_missing_builtins is None else allow_missing_builtins
         )
+        self.enable_instruction_trace = enable_instruction_trace
+
+        if self.proof_mode:
+            assert (
+                self.enable_instruction_trace
+            ), "Instruction tracing must be enabled in proof mode."
 
         if not allow_missing_builtins:
             non_existing_builtins = set(self.program.builtins) - set(self.layout.builtins.keys())
@@ -117,10 +128,13 @@ class CairoRunner:
                 included=included,
                 ratio=self.layout.builtins["pedersen"].ratio,
                 hash_func=pedersen_hash,
+                instance_def=self.layout.builtins["pedersen"],
             ),
             range_check=lambda name, included: RangeCheckBuiltinRunner(
+                name="range_check",
                 included=included,
                 ratio=self.layout.builtins["range_check"].ratio,
+                ratio_den=1,
                 inner_rc_bound=2**16,
                 n_parts=self.layout.builtins["range_check"].n_parts,
             ),
@@ -130,6 +144,7 @@ class CairoRunner:
                 ratio=self.layout.builtins["ecdsa"].ratio,
                 process_signature=process_ecdsa,
                 verify_signature=verify_ecdsa_sig,
+                instance_def=self.layout.builtins["ecdsa"],
             ),
             bitwise=lambda name, included: BitwiseBuiltinRunner(
                 included=included, bitwise_builtin=self.layout.builtins["bitwise"]
@@ -142,6 +157,20 @@ class CairoRunner:
             ),
             poseidon=lambda name, included: PoseidonBuiltinRunner(
                 included=included, instance_def=self.layout.builtins["poseidon"]
+            ),
+            range_check96=lambda name, included: RangeCheckBuiltinRunner(
+                name="range_check96",
+                included=included,
+                ratio=self.layout.builtins["range_check96"].ratio,
+                ratio_den=self.layout.builtins["range_check96"].ratio_den,
+                inner_rc_bound=2**16,
+                n_parts=self.layout.builtins["range_check96"].n_parts,
+            ),
+            add_mod=lambda name, included: AddModBuiltinRunner(
+                included=included, instance_def=self.layout.builtins["add_mod"]
+            ),
+            mul_mod=lambda name, included: MulModBuiltinRunner(
+                included=included, instance_def=self.layout.builtins["mul_mod"]
             ),
             **additional_builtin_factories,
         )
@@ -213,6 +242,15 @@ class CairoRunner:
         # Builtin segments.
         for builtin_runner in self.builtin_runners.values():
             builtin_runner.initialize_segments(self)
+
+    def initialize_zero_segment(self):
+        # Add a zero segment if needed. This segment goes in the cairo pie to the extra segments.
+        # Therefore, it should be added after the initialization of the ret_fp_segment and
+        # ret_pc_segment.
+        for builtin_runner in self.builtin_runners.values():
+            n_zeros = builtin_runner.get_needed_number_allocated_zeros()
+            if n_zeros > 0:
+                builtin_runner.set_address_allocated_zeros(self.segments.add_zero_segment(n_zeros))
 
     def initialize_main_entrypoint(self):
         """
@@ -296,6 +334,7 @@ class CairoRunner:
             static_locals=dict(segments=self.segments, **static_locals),
             builtin_runners=self.builtin_runners,
             program_base=self.program_base,
+            enable_instruction_trace=self.enable_instruction_trace,
         )
 
         for builtin_runner in self.builtin_runners.values():
@@ -436,11 +475,10 @@ class CairoRunner:
         If not, the number of steps should be increased or a different layout should be used.
         """
         try:
-            if self.layout.layout_name != DYNAMIC_LAYOUT_NAME:
-                for builtin_runner in self.builtin_runners.values():
-                    builtin_runner.get_used_cells_and_allocated_size(self)
-                self.check_range_check_usage()
-                self.check_memory_usage()
+            for builtin_runner in self.builtin_runners.values():
+                builtin_runner.get_used_cells_and_allocated_size(self)
+            self.check_range_check_usage()
+            self.check_memory_usage()
             self.check_diluted_check_usage()
         except InsufficientAllocatedCells as e:
             print(f"Warning: {e} Increasing number of steps.")
@@ -474,6 +512,8 @@ class CairoRunner:
         for builtin_runner in self.builtin_runners.values():
             builtin_runner.finalize_segments(self)
 
+        self.segments.finalize_zero_segment()
+
         self._segments_finalized = True
 
     def finalize_segments_by_cairo_pie(self, cairo_pie: CairoPie):
@@ -501,11 +541,14 @@ class CairoRunner:
         """
         Checks that there are enough trace cells to fill the entire range checks range.
         """
+        assert self.layout.rc_units is not None, "RC units should not be None in proof mode."
+
         rc_min, rc_max = self.get_perm_range_check_limits()
         rc_units_used_by_builtins = sum(
             builtin_runner.get_used_perm_range_check_units(self)
             for builtin_runner in self.builtin_runners.values()
         )
+
         # Out of the range check units allowed per step three are used for the instruction.
         unused_rc_units = (
             self.layout.rc_units - 3
@@ -526,6 +569,9 @@ class CairoRunner:
             for builtin_runner in self.builtin_runners.values()
             for addr in builtin_runner.get_memory_accesses(self)
         }
+        if self.segments.zero_segment is not None:
+            for i in range(self.segments.zero_segment_size):
+                builtin_accessed_addresses.add(self.segments.zero_segment + i)
         return self.segments.get_memory_holes(
             accessed_addresses=self.accessed_addresses | builtin_accessed_addresses
         )
@@ -534,10 +580,15 @@ class CairoRunner:
         """
         Checks that there are enough trace cells to fill the entire memory range.
         """
+        assert (
+            self.layout.memory_units_per_step is not None
+        ), "Memory units per step should not be None in proof mode."
+
         builtins_memory_units = sum(
             builtin_runner.get_allocated_memory_units(self)
             for builtin_runner in self.builtin_runners.values()
         )
+
         # Out of the memory units available per step, a fraction is used for public memory, and
         # four are used for the instruction.
         total_memory_units = self.layout.memory_units_per_step * self.vm.current_step
@@ -559,6 +610,10 @@ class CairoRunner:
         """
         if self.layout.diluted_pool_instance_def is None:
             return
+        log_units_per_step = self.layout.diluted_pool_instance_def.log_units_per_step
+        assert (
+            log_units_per_step is not None
+        ), "Diluted log units per step should not be None in proof mode."
 
         diluted_units_used_by_builtins = sum(
             builtin_runner.get_used_diluted_check_units(
@@ -569,7 +624,6 @@ class CairoRunner:
             for builtin_runner in self.builtin_runners.values()
         )
 
-        log_units_per_step = self.layout.diluted_pool_instance_def.log_units_per_step
         diluted_units = (
             pow(2, log_units_per_step) * self.vm.current_step
             if log_units_per_step >= 0
@@ -638,9 +692,10 @@ class CairoRunner:
             for addr, value in self.vm_memory.items()
         }
         self.relocated_memory = MemoryDict(initializer)
-        self.relocated_trace = relocate_trace(
-            self.vm.trace, self.segment_offsets, self.program.prime
-        )
+        if self.enable_instruction_trace:
+            self.relocated_trace = relocate_trace(
+                self.vm.trace, self.segment_offsets, self.program.prime
+            )
         for builtin_runner in self.builtin_runners.values():
             builtin_runner.relocate(self.relocate_value)
 
@@ -718,7 +773,7 @@ class CairoRunner:
             fp = self.relocate_value(fp)
 
         info = f"""\
-Number of steps: {len(self.vm.trace)} {
+Number of steps: {self.vm.current_step} {
     '' if self.original_steps is None else f'(originally, {self.original_steps})'}
 Used memory cells: {len(self.vm_memory)}
 Register values after execution:
@@ -769,7 +824,7 @@ fp = {fp}
         return builtin_segments
 
     def get_execution_resources(self) -> ExecutionResources:
-        n_steps = len(self.vm.trace) if self.original_steps is None else self.original_steps
+        n_steps = self.vm.current_step if self.original_steps is None else self.original_steps
         n_memory_holes = self.get_memory_holes()
         builtin_instance_counter = {
             builtin_name: builtin_runner.get_used_instances(self)
@@ -858,12 +913,19 @@ def get_runner_from_code(
     return get_main_runner(program=program, hint_locals={}, layout=layout)
 
 
-def get_main_runner(program: Program, hint_locals: Dict[str, Any], layout: str) -> CairoRunner:
+def get_main_runner(
+    program: Program,
+    hint_locals: Dict[str, Any],
+    layout: str,
+    allow_missing_builtins: Optional[bool] = None,
+) -> CairoRunner:
     """
     Creates a Cairo runner and runs its main-entrypoint.
     Returns the runner.
     """
-    runner = CairoRunner(program=program, layout=layout)
+    runner = CairoRunner(
+        program=program, layout=layout, allow_missing_builtins=allow_missing_builtins
+    )
     run_main_entrypoint(runner=runner, hint_locals=hint_locals)
     return runner
 
@@ -874,6 +936,7 @@ def run_main_entrypoint(runner: CairoRunner, hint_locals: Dict[str, Any]):
     """
     runner.initialize_segments()
     end = runner.initialize_main_entrypoint()
+    runner.initialize_zero_segment()
     runner.initialize_vm(hint_locals=hint_locals)
     runner.run_until_pc(end)
     runner.end_run()

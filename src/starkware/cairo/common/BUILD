@@ -1,5 +1,6 @@
 load("//src/starkware/cairo:vars.bzl", "CAIRO_COMMON_LIB_ADDITIONAL_FILES", "CAIRO_COMMON_LIB_ADDITIONAL_LIBS")
 load("//src/starkware/cairo/lang:cairo_rules.bzl", "cairo_library")
+load("//bazel_utils/python:defs.bzl", "requirement")
 
 cairo_library(
     name = "cairo_common_cairo_lib",
@@ -27,16 +28,18 @@ cairo_library(
         "memset.cairo",
         "merkle_multi_update.cairo",
         "merkle_update.cairo",
-        "patricia_with_sponge.cairo",
+        "modulo.cairo",
         "patricia.cairo",
-        "patricia_with_poseidon.cairo",
         "patricia_utils.cairo",
+        "patricia_with_poseidon.cairo",
+        "patricia_with_sponge.cairo",
         "poseidon_state.cairo",
         "pow.cairo",
         "registers.cairo",
         "segments.cairo",
         "serialize.cairo",
         "set.cairo",
+        "sha256_state.cairo",
         "signature.cairo",
         "small_merkle_tree.cairo",
         "sponge_as_hash.cairo",
@@ -49,13 +52,18 @@ cairo_library(
         "//src/starkware/cairo/common/cairo_blake2s:packed_blake2s.cairo",
         "//src/starkware/cairo/common/cairo_keccak:keccak.cairo",
         "//src/starkware/cairo/common/cairo_keccak:packed_keccak.cairo",
-        "//src/starkware/cairo/common/cairo_secp:bigint.cairo",
-        "//src/starkware/cairo/common/cairo_secp:constants.cairo",
-        "//src/starkware/cairo/common/cairo_secp:ec.cairo",
-        "//src/starkware/cairo/common/cairo_secp:field.cairo",
-        "//src/starkware/cairo/common/cairo_secp:signature.cairo",
+        "//src/starkware/cairo/common/cairo_sha256:sha256_utils.cairo",
         "//src/starkware/cairo/common/keccak_utils:keccak_utils.cairo",
     ] + CAIRO_COMMON_LIB_ADDITIONAL_FILES,
+    hint_deps = [
+        "//src/starkware/crypto:starkware_crypto_lib",
+        "//src/starkware/python:starkware_python_utils_lib",
+        requirement("eth_hash"),
+    ],
+    deps = [
+        "//src/starkware/cairo/common/cairo_secp:cairo_secp256k1",
+        "//src/starkware/cairo/common/secp256r1:cairo_secp256r1",
+    ],
 )
 
 py_library(
@@ -68,6 +76,7 @@ py_library(
     deps = [
         "//src/starkware/cairo/lang:cairo_constants_lib",
         "//src/starkware/python:starkware_python_utils_lib",
+        requirement("numpy"),
     ],
 )
 
@@ -94,10 +103,10 @@ py_library(
     visibility = ["//visibility:public"],
     deps = [
         "poseidon_utils_lib",
-        "//src/starkware/cairo/lang/vm:cairo_vm_crypto_lib",
         "//src/starkware/cairo/lang:cairo_constants_lib",
-        "//src/starkware/python:starkware_python_utils_lib",
+        "//src/starkware/cairo/lang/vm:cairo_vm_crypto_lib",
         "//src/starkware/python:starkware_merkle_tree_lib",
+        "//src/starkware/python:starkware_python_utils_lib",
     ] + CAIRO_COMMON_LIB_ADDITIONAL_LIBS,
 )
 
@@ -129,12 +138,14 @@ py_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "cairo_common_lib",
+        ":cairo_common_lib",
         "//src/starkware/cairo/lang/builtins:cairo_run_builtins_lib",
         "//src/starkware/cairo/lang/compiler:cairo_compile_lib",
         "//src/starkware/cairo/lang/tracer:cairo_tracer_lib",
+        "//src/starkware/cairo/lang/vm:cairo_relocatable_lib",
         "//src/starkware/cairo/lang/vm:cairo_run_lib",
         "//src/starkware/cairo/lang/vm:cairo_vm_crypto_lib",
         "//src/starkware/cairo/lang/vm:cairo_vm_lib",
+        "//src/starkware/python:starkware_python_utils_lib",
     ],
 )
